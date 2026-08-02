@@ -22,7 +22,7 @@ The application utilizes a decoupled, Object-Oriented software architecture to i
 ### Landmark Topology Reference
 The system utilizes MediaPipe's 33-point topological skeletal map to construct the necessary kinematic vectors.
 
-![MediaPipe Pose Landmark Topology](images/mediapipe_topology.jpg)
+![MediaPipe Pose Landmark Topology](images/mediapipe-topology.jpg)
 
 ---
 

@@ -4,6 +4,9 @@ import mediapipe as mp
 import numpy as np
 import time
 import sys
+import tkinter as tk
+from tkinter import font
+from PIL import Image, ImageTk
 
 # ==========================================
 # GLOBALS & DEPENDENCIES
@@ -23,7 +26,6 @@ class BaseExercise:
         self.smoothing_factor = 0.2
 
     def calculate_angle(self, a, b, c):
-        """Universal math function for all exercises."""
         a = np.array(a)
         b = np.array(b)
         c = np.array(c)
@@ -31,7 +33,6 @@ class BaseExercise:
         ba = a - b
         bc = c - b
 
-        # Prevent zero-division during math
         norm_ba = max(np.linalg.norm(ba), 1e-6)
         norm_bc = max(np.linalg.norm(bc), 1e-6)
 
@@ -42,7 +43,6 @@ class BaseExercise:
         return np.degrees(angle)
 
     def process_frame(self, landmarks, h, w):
-        """To be overridden by specific exercise classes."""
         raise NotImplementedError("Subclasses must implement this method")
 
 
@@ -53,21 +53,18 @@ class ElbowFlexion(BaseExercise):
     def __init__(self, side="right"):
         super().__init__()
         self.stage = "calibration_start"
-        self.side = side.lower()  # Accepts 'right' or 'left'
+        self.side = side.lower()
 
         self.baseline_upper_ratio = 0.0
         self.baseline_forearm_ratio = 0.0
         self.target_ext = 0.0
         self.target_flex = 180.0
 
-        # Replacing frame counters with time-based tracking
         self.timer_start = None
-
         self.active_error_msg = ""
         self.error_timer_start = None
 
     def process_frame(self, landmarks, h, w):
-        # 1. DYNAMIC LATERALITY (Left vs Right Arm Selection)
         if self.side == "right":
             shoulder_idx = mp_pose.PoseLandmark.RIGHT_SHOULDER.value
             elbow_idx = mp_pose.PoseLandmark.RIGHT_ELBOW.value
@@ -92,7 +89,6 @@ class ElbowFlexion(BaseExercise):
         req_vis = 0.7 if self.stage.startswith("calib") else 0.4
 
         if t_shoulder.visibility > req_vis and t_elbow.visibility > req_vis and t_wrist.visibility > req_vis and t_hip.visibility > req_vis:
-
             shoulder = [t_shoulder.x * w, t_shoulder.y * h]
             elbow = [t_elbow.x * w, t_elbow.y * h]
             wrist = [t_wrist.x * w, t_wrist.y * h]
@@ -113,7 +109,6 @@ class ElbowFlexion(BaseExercise):
             upper_ratio = upper_arm_length / torso_length
             forearm_ratio = forearm_length / torso_length
 
-            # 2. TIME-BASED CALIBRATION LOGIC
             if self.stage.startswith("calibration"):
                 if self.stage == "calibration_start":
                     if self.smoothed_angle > 140 and wrist[1] > elbow[1]:
@@ -155,7 +150,7 @@ class ElbowFlexion(BaseExercise):
                         feedback_msg = f"HOLD THIS FLEX: {seconds_left}s"
 
                         if elapsed >= 2.0:
-                            self.target_flex += 15  # Give the user a 15-degree buffer
+                            self.target_flex += 15
                             self.stage = "extended"
                             self.timer_start = None
                     else:
@@ -164,13 +159,8 @@ class ElbowFlexion(BaseExercise):
 
                 return self.smoothed_angle, elbow, True, feedback_msg
 
-            # --- ADJUSTED TOLERANCES (Fixed for Human Anatomy) ---
-            # Relaxed back to 0.75 to account for the natural carrying angle of the elbow during flexion
             is_upper_arm_2d_stable = upper_ratio > (self.baseline_upper_ratio * 0.75)
             is_forearm_2d_stable = forearm_ratio > (self.baseline_forearm_ratio * 0.75)
-
-            # NOTE: Z-axis math is inherently noisy in MediaPipe (Arrowsmith et al., 2023).
-            # We are removing the Z-axis check completely and relying purely on 2D apparent length.
             is_in_plane = is_upper_arm_2d_stable and is_forearm_2d_stable
 
             dx = elbow[0] - shoulder[0]
@@ -187,7 +177,6 @@ class ElbowFlexion(BaseExercise):
 
             good_form = is_elbow_down and is_in_plane and is_trunk_stable and is_side_profile and is_elbow_pinned
 
-            # 3. TIME-BASED ERROR LOGIC
             if not good_form:
                 self.stage = "error"
                 if self.error_timer_start is None:
@@ -206,7 +195,7 @@ class ElbowFlexion(BaseExercise):
             if self.error_timer_start is not None:
                 feedback_msg = self.active_error_msg
                 if (time.time() - self.error_timer_start) > 1.5:
-                    self.error_timer_start = None  # Clear error after 1.5 seconds
+                    self.error_timer_start = None
 
             if good_form:
                 if self.smoothed_angle > self.target_ext and is_wrist_down:
@@ -219,7 +208,6 @@ class ElbowFlexion(BaseExercise):
                     self.stage = "flexed"
 
             return self.smoothed_angle, elbow, good_form, feedback_msg
-
         else:
             if not self.stage.startswith("calibration"):
                 self.stage = "error"
@@ -227,95 +215,160 @@ class ElbowFlexion(BaseExercise):
 
 
 # ==========================================
-# 3. MAIN APPLICATION LOOP
+# 3. TKINTER APPLICATION CLASS
 # ==========================================
-def main():
-    # Setup CSV Data Logging (Essential for thesis graphs!)
-    session_id = int(time.time())
-    csv_filename = f"session_data_{session_id}.csv"
+class PhysioApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Intelligent Physiotherapy Assistant")
+        self.root.geometry("1000x650")
+        self.root.configure(bg="#2C3E50")
 
-    with open(csv_filename, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(["Timestamp", "Smoothed_Angle", "Stage", "Good_Form", "Feedback"])
+        self.cap = None
+        self.pose = None
+        self.current_exercise = None
+        self.csv_file = None
+        self.csv_writer = None
 
-        with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-            cap = cv2.VideoCapture(0)
+        # Build UI Frames
+        self.main_menu_frame = tk.Frame(self.root, bg="#2C3E50")
+        self.tracking_frame = tk.Frame(self.root, bg="#2C3E50")
 
-            if not cap.isOpened():
-                print("Error: Could not access the webcam. Check permissions.")
-                sys.exit(1)
+        self.build_main_menu()
+        self.build_tracking_dashboard()
 
-            # Pass 'left' or 'right' depending on which arm the patient is rehabbing
-            current_exercise = ElbowFlexion(side="right")
+        # Start by showing the main menu
+        self.main_menu_frame.pack(fill="both", expand=True)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-            try:
-                while True:
-                    success, img = cap.read()
-                    if not success:
-                        continue
+    def build_main_menu(self):
+        title_font = font.Font(family="Helvetica", size=24, weight="bold")
+        btn_font = font.Font(family="Helvetica", size=14)
 
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    results = pose.process(img_rgb)
-                    h, w, _ = img.shape
+        tk.Label(self.main_menu_frame, text="Intelligent Physiotherapy Assistant", font=title_font, fg="white",
+                 bg="#2C3E50").pack(pady=40)
+        tk.Label(self.main_menu_frame, text="Select Exercise Protocol", font=btn_font, fg="#BDC3C7", bg="#2C3E50").pack(
+            pady=10)
 
-                    if results.pose_landmarks:
+        # Dashboard Buttons
+        tk.Button(self.main_menu_frame, text="Elbow Flexion (Right Arm)", font=btn_font, bg="#2980B9", fg="white",
+                  width=30, height=2,
+                  command=lambda: self.start_tracking("right")).pack(pady=10)
 
-                        # --- PRIVACY CONSTRAINT: FACE ANONYMIZATION ---
-                        nose = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
-                        l_ear = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_EAR.value]
-                        r_ear = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_EAR.value]
+        tk.Button(self.main_menu_frame, text="Elbow Flexion (Left Arm)", font=btn_font, bg="#2980B9", fg="white",
+                  width=30, height=2,
+                  command=lambda: self.start_tracking("left")).pack(pady=10)
 
-                        if nose.visibility > 0.5:
-                            nx, ny = int(nose.x * w), int(nose.y * h)
+    def build_tracking_dashboard(self):
+        # Video Feed Label
+        self.video_label = tk.Label(self.tracking_frame, bg="black")
+        self.video_label.pack(side="left", padx=20, pady=20)
 
-                            # Calculate distance between ears in pixels to dynamically scale the mask
-                            ear_dist = abs(l_ear.x - r_ear.x) * w
+        # Right Side Dashboard Info
+        info_frame = tk.Frame(self.tracking_frame, bg="#2C3E50")
+        info_frame.pack(side="right", fill="both", expand=True, padx=20, pady=20)
 
-                            # Multiply by 1.5 to ensure it covers the whole head, with a fallback just in case
-                            dynamic_radius = int(ear_dist * 1.5) if ear_dist > 0 else int(h * 0.08)
+        info_font = font.Font(family="Helvetica", size=18, weight="bold")
 
-                            cv2.circle(img, (nx, ny), dynamic_radius, (25, 25, 25), -1)
+        self.lbl_reps = tk.Label(info_frame, text="Reps: 0", font=info_font, fg="#2ECC71", bg="#2C3E50")
+        self.lbl_reps.pack(pady=20)
 
-                        # --- MISSING LINES RESTORED HERE ---
-                        mp_draw.draw_landmarks(img, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-                        angle, joint_pos, is_good, msg = current_exercise.process_frame(results.pose_landmarks.landmark,
-                                                                                        h, w)
-                        # -----------------------------------
+        self.lbl_stage = tk.Label(info_frame, text="Stage: N/A", font=info_font, fg="#F1C40F", bg="#2C3E50")
+        self.lbl_stage.pack(pady=20)
 
-                        # --- DATA LOGGING ---
-                        if angle is not None:
-                            # Write real-time data to CSV for thesis analysis
-                            writer.writerow([time.time(), round(angle, 2), current_exercise.stage, is_good, msg])
+        self.lbl_feedback = tk.Label(info_frame, text="", font=font.Font(family="Helvetica", size=14, weight="bold"),
+                                     fg="#E74C3C", bg="#2C3E50", wraplength=250)
+        self.lbl_feedback.pack(pady=40)
 
-                            color = (0, 255, 0) if is_good else (0, 0, 255)
-                            cv2.putText(img, f"{int(angle)} deg",
-                                        tuple(np.multiply(joint_pos, [1, 1]).astype(int)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
+        btn_stop = tk.Button(info_frame, text="End Session", font=font.Font(family="Helvetica", size=14), bg="#C0392B",
+                             fg="white", width=15, command=self.stop_tracking)
+        btn_stop.pack(side="bottom", pady=40)
 
-                        if msg:
-                            cv2.putText(img, msg, (50, 150),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3, cv2.LINE_AA)
-                    # --- GUI OVERLAYS ---
-                    cv2.rectangle(img, (0, 0), (250, 73), (245, 117, 16), -1)
-                    cv2.putText(img, 'REPS', (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-                    cv2.putText(img, str(current_exercise.counter), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 2,
-                                (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(img, 'STAGE', (100, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-                    cv2.putText(img, current_exercise.stage, (100, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2,
-                                cv2.LINE_AA)
+    def start_tracking(self, side):
+        self.main_menu_frame.pack_forget()
+        self.tracking_frame.pack(fill="both", expand=True)
 
-                    cv2.imshow("Physio Assistant Tracker", img)
+        # Initialize dependencies manually without 'with' statement so they persist
+        self.pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.cap = cv2.VideoCapture(0)
+        self.current_exercise = ElbowFlexion(side=side)
 
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+        # Setup Logging
+        session_id = int(time.time())
+        self.csv_file = open(f"session_data_{session_id}.csv", mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(["Timestamp", "Smoothed_Angle", "Stage", "Good_Form", "Feedback"])
 
-            except Exception as e:
-                print(f"A critical error occurred: {e}")
+        self.update_frame()
 
-            finally:
-                cap.release()
-                cv2.destroyAllWindows()
-                print(f"Resources safely released. Data saved to {csv_filename}")
+    def update_frame(self):
+        if self.cap is None or not self.cap.isOpened():
+            return
+
+        success, img = self.cap.read()
+        if success:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.pose.process(img_rgb)
+            h, w, _ = img.shape
+
+            if results.pose_landmarks:
+                # Privacy Masking
+                nose = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
+                l_ear = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_EAR.value]
+                r_ear = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_EAR.value]
+
+                if nose.visibility > 0.5:
+                    nx, ny = int(nose.x * w), int(nose.y * h)
+                    ear_dist = abs(l_ear.x - r_ear.x) * w
+                    dynamic_radius = int(ear_dist * 1.5) if ear_dist > 0 else int(h * 0.08)
+                    cv2.circle(img_rgb, (nx, ny), dynamic_radius, (25, 25, 25), -1)
+
+                mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+                angle, joint_pos, is_good, msg = self.current_exercise.process_frame(results.pose_landmarks.landmark, h,
+                                                                                     w)
+
+                if angle is not None:
+                    self.csv_writer.writerow([time.time(), round(angle, 2), self.current_exercise.stage, is_good, msg])
+                    color = (0, 255, 0) if is_good else (255, 0, 0)  # RGB format for Tkinter rendering
+                    cv2.putText(img_rgb, f"{int(angle)} deg", tuple(np.multiply(joint_pos, [1, 1]).astype(int)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
+
+                # Update UI Dashboard Labels
+                self.lbl_reps.config(text=f"Reps: {self.current_exercise.counter}")
+                self.lbl_stage.config(text=f"Stage: {self.current_exercise.stage.replace('_', ' ').title()}")
+                self.lbl_feedback.config(text=msg if msg else "Form: Optimal", fg="#E74C3C" if msg else "#2ECC71")
+
+            # Convert OpenCV frame to Tkinter Image
+            img_pil = Image.fromarray(img_rgb)
+            img_tk = ImageTk.PhotoImage(image=img_pil)
+            self.video_label.imgtk = img_tk
+            self.video_label.configure(image=img_tk)
+
+        # Loop the function every 10 milliseconds
+        self.root.after(10, self.update_frame)
+
+    def stop_tracking(self):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        if self.pose:
+            self.pose.close()
+            self.pose = None
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+
+        self.tracking_frame.pack_forget()
+        self.main_menu_frame.pack(fill="both", expand=True)
+
+    def on_close(self):
+        self.stop_tracking()
+        self.root.destroy()
+        sys.exit(0)
+
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = PhysioApp(root)
+    root.mainloop()

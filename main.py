@@ -102,19 +102,23 @@ class ElbowFlexion(BaseExercise):
                 self.smoothed_angle = raw_angle
             else:
                 self.smoothed_angle = (self.smoothing_factor * raw_angle) + (
-                            (1 - self.smoothing_factor) * self.smoothed_angle)
+                        (1 - self.smoothing_factor) * self.smoothed_angle)
 
             upper_arm_length = np.linalg.norm(np.array(shoulder) - np.array(elbow))
             forearm_length = np.linalg.norm(np.array(elbow) - np.array(wrist))
             torso_length = max(np.linalg.norm(np.array(shoulder) - np.array(hip)), 1e-6)
 
-            upper_ratio = upper_arm_length / torso_length
-            forearm_ratio = forearm_length / torso_length
+            # --- OPTIMIZATION 1: ZeroDivisionError Safeguard ---
+            try:
+                upper_ratio = upper_arm_length / torso_length
+                forearm_ratio = forearm_length / torso_length
+            except ZeroDivisionError:
+                upper_ratio = 0.0
+                forearm_ratio = 0.0
 
             # ==========================================
             # PRE-CALIBRATION SIDE-PROFILE GUARD
             # ==========================================
-            # We calculate shoulder width early so calibration can mandate a sagittal stance
             shoulder_width = abs(t_shoulder.x - opp_shoulder.x) * w
             is_side_profile = shoulder_width < (0.35 * torso_length)
 
@@ -123,7 +127,6 @@ class ElbowFlexion(BaseExercise):
             # ==========================================
             if self.stage.startswith("calibration"):
 
-                # Halt calibration immediately if the user turns toward the camera
                 if not is_side_profile:
                     self.calib_frames = max(0, self.calib_frames - 2)
                     self.flex_calib_frames = max(0, self.flex_calib_frames - 2)
@@ -192,7 +195,6 @@ class ElbowFlexion(BaseExercise):
             is_wrist_down = wrist[1] > elbow[1]
 
             is_trunk_stable = abs(shoulder[0] - hip[0]) < (0.20 * torso_length)
-            # shoulder_width and is_side_profile are already calculated above
 
             good_form = is_elbow_down and is_in_plane and is_trunk_stable and is_side_profile and is_elbow_pinned
 
@@ -310,7 +312,6 @@ class PhysioApp:
         self.main_menu_frame.pack_forget()
         self.tracking_frame.pack(fill="both", expand=True)
 
-        # Initialize dependencies manually without 'with' statement so they persist
         self.pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
         self.cap = cv2.VideoCapture(0)
         self.current_exercise = ElbowFlexion(side=side)
@@ -349,36 +350,35 @@ class PhysioApp:
 
                 mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-                angle, joint_pos, is_good, msg = self.current_exercise.process_frame(results.pose_landmarks.landmark, h, w)
+                angle, joint_pos, is_good, msg = self.current_exercise.process_frame(results.pose_landmarks.landmark, h,
+                                                                                     w)
 
-                # Head-Boundary Guard (VISUAL WARNING ONLY - No longer breaks the state machine)
                 if nose.visibility > 0.5 and nose.y < 0.10:
                     is_good = False
-                    # Appends the step back warning while keeping calibration text visible
                     msg = "STEP BACK! " + (msg if msg else "")
 
                 if angle is not None:
                     self.csv_writer.writerow([time.time(), round(angle, 2), self.current_exercise.stage, is_good, msg])
+
+                    # --- OPTIMIZATION 2: CSV Data Flush ---
+                    self.csv_file.flush()
+
                     color = (0, 255, 0) if is_good else (255, 0, 0)
                     cv2.putText(img_rgb, f"{int(angle)} deg", tuple(np.multiply(joint_pos, [1, 1]).astype(int)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
 
-                # --- ON-SCREEN TEXT OVERLAY ---
                 if msg:
                     cv2.putText(img_rgb, msg, (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3, cv2.LINE_AA)
 
-                # Update UI Dashboard Labels
                 self.lbl_reps.config(text=f"Reps: {self.current_exercise.counter}")
                 self.lbl_stage.config(text=f"Stage: {self.current_exercise.stage.replace('_', ' ').title()}")
                 self.lbl_feedback.config(text=msg if msg else "Form: Optimal", fg="#E74C3C" if msg else "#2ECC71")
 
-            # Convert OpenCV frame to Tkinter Image
             img_pil = Image.fromarray(img_rgb)
             img_tk = ImageTk.PhotoImage(image=img_pil)
             self.video_label.imgtk = img_tk
             self.video_label.configure(image=img_tk)
 
-        # Dynamic Frame Scheduling
         elapsed_ms = int((time.time() - start_time) * 1000)
         delay = max(1, 33 - elapsed_ms)
         self.root.after(delay, self.update_frame)

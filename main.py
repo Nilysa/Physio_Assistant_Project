@@ -60,7 +60,9 @@ class ElbowFlexion(BaseExercise):
         self.target_ext = 0.0
         self.target_flex = 180.0
 
-        self.timer_start = None
+        self.calib_frames = 0
+        self.flex_calib_frames = 0
+
         self.active_error_msg = ""
         self.error_timer_start = None
 
@@ -109,59 +111,77 @@ class ElbowFlexion(BaseExercise):
             upper_ratio = upper_arm_length / torso_length
             forearm_ratio = forearm_length / torso_length
 
+            # ==========================================
+            # PRE-CALIBRATION SIDE-PROFILE GUARD
+            # ==========================================
+            # We calculate shoulder width early so calibration can mandate a sagittal stance
+            shoulder_width = abs(t_shoulder.x - opp_shoulder.x) * w
+            is_side_profile = shoulder_width < (0.35 * torso_length)
+
+            # ==========================================
+            # ROBUST CALIBRATION (Frame-Based Data Storage)
+            # ==========================================
             if self.stage.startswith("calibration"):
+
+                # Halt calibration immediately if the user turns toward the camera
+                if not is_side_profile:
+                    self.calib_frames = max(0, self.calib_frames - 2)
+                    self.flex_calib_frames = max(0, self.flex_calib_frames - 2)
+                    return self.smoothed_angle, elbow, False, "TURN TO SIDE PROFILE!"
+
                 if self.stage == "calibration_start":
                     if self.smoothed_angle > 140 and wrist[1] > elbow[1]:
-                        if self.timer_start is None:
-                            self.timer_start = time.time()
-
-                        elapsed = time.time() - self.timer_start
-                        seconds_left = max(0, 3 - int(elapsed))
+                        self.calib_frames += 1
+                        seconds_left = max(0, 3 - (self.calib_frames // 30))
                         feedback_msg = f"STAND STILL: {seconds_left}s"
 
-                        if elapsed >= 3.0:
+                        if self.calib_frames >= 90:
                             self.baseline_upper_ratio = upper_ratio
                             self.baseline_forearm_ratio = forearm_ratio
                             self.target_ext = self.smoothed_angle - 15
                             self.stage = "calibration_transition"
-                            self.timer_start = None
+                            self.calib_frames = 0
                     else:
-                        self.timer_start = None
+                        self.calib_frames = max(0, self.calib_frames - 2)
                         feedback_msg = "DROP ARM STRAIGHT TO START"
 
                 elif self.stage == "calibration_transition":
                     feedback_msg = "SUCCESS! NOW BEND ARM..."
-                    if self.timer_start is None:
-                        self.timer_start = time.time()
-                    if (time.time() - self.timer_start) > 1.5:
+                    self.calib_frames += 1
+                    if self.calib_frames > 45:
                         self.stage = "calibration_flex"
-                        self.timer_start = None
+                        self.calib_frames = 0
 
                 elif self.stage == "calibration_flex":
                     if self.smoothed_angle < self.target_flex:
                         self.target_flex = self.smoothed_angle
 
                     if self.smoothed_angle < 60:
-                        if self.timer_start is None:
-                            self.timer_start = time.time()
-
-                        elapsed = time.time() - self.timer_start
-                        seconds_left = max(0, 2 - int(elapsed))
+                        self.flex_calib_frames += 1
+                        seconds_left = max(0, 2 - (self.flex_calib_frames // 30))
                         feedback_msg = f"HOLD THIS FLEX: {seconds_left}s"
 
-                        if elapsed >= 2.0:
+                        if self.flex_calib_frames >= 60:
                             self.target_flex += 15
                             self.stage = "extended"
-                            self.timer_start = None
+                            self.flex_calib_frames = 0
                     else:
-                        self.timer_start = None
+                        self.flex_calib_frames = max(0, self.flex_calib_frames - 2)
                         feedback_msg = "BEND ARM FULLY"
 
                 return self.smoothed_angle, elbow, True, feedback_msg
 
+            # ==========================================
+            # FORM ENFORCEMENT & RESTORED Z-AXIS
+            # ==========================================
             is_upper_arm_2d_stable = upper_ratio > (self.baseline_upper_ratio * 0.75)
             is_forearm_2d_stable = forearm_ratio > (self.baseline_forearm_ratio * 0.75)
-            is_in_plane = is_upper_arm_2d_stable and is_forearm_2d_stable
+
+            wrist_depth_diff = abs(t_wrist.z - t_shoulder.z)
+            elbow_depth_diff = abs(t_elbow.z - t_shoulder.z)
+            is_arm_in_z_plane = (wrist_depth_diff < 0.40) and (elbow_depth_diff < 0.30)
+
+            is_in_plane = is_upper_arm_2d_stable and is_forearm_2d_stable and is_arm_in_z_plane
 
             dx = elbow[0] - shoulder[0]
             dy = elbow[1] - shoulder[1]
@@ -172,8 +192,7 @@ class ElbowFlexion(BaseExercise):
             is_wrist_down = wrist[1] > elbow[1]
 
             is_trunk_stable = abs(shoulder[0] - hip[0]) < (0.20 * torso_length)
-            shoulder_width = abs(t_shoulder.x - opp_shoulder.x) * w
-            is_side_profile = shoulder_width < (0.35 * torso_length)
+            # shoulder_width and is_side_profile are already calculated above
 
             good_form = is_elbow_down and is_in_plane and is_trunk_stable and is_side_profile and is_elbow_pinned
 
@@ -181,12 +200,12 @@ class ElbowFlexion(BaseExercise):
                 self.stage = "error"
                 if self.error_timer_start is None:
                     self.error_timer_start = time.time()
-                    if not is_elbow_pinned:
+                    if not is_side_profile:
+                        self.active_error_msg = "TURN TO SIDE!"
+                    elif not is_elbow_pinned:
                         self.active_error_msg = "KEEP ELBOW PINNED!"
                     elif not is_in_plane:
                         self.active_error_msg = "ARM SWINGING OUT!"
-                    elif not is_side_profile:
-                        self.active_error_msg = "TURN TO SIDE!"
                     elif not is_trunk_stable:
                         self.active_error_msg = "TRUNK SWAY!"
                     else:
@@ -197,6 +216,9 @@ class ElbowFlexion(BaseExercise):
                 if (time.time() - self.error_timer_start) > 1.5:
                     self.error_timer_start = None
 
+            # ==========================================
+            # REP COUNTING LOGIC
+            # ==========================================
             if good_form:
                 if self.smoothed_angle > self.target_ext and is_wrist_down:
                     if self.stage == 'flexed':
@@ -302,6 +324,8 @@ class PhysioApp:
         self.update_frame()
 
     def update_frame(self):
+        start_time = time.time()
+
         if self.cap is None or not self.cap.isOpened():
             return
 
@@ -325,14 +349,23 @@ class PhysioApp:
 
                 mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-                angle, joint_pos, is_good, msg = self.current_exercise.process_frame(results.pose_landmarks.landmark, h,
-                                                                                     w)
+                angle, joint_pos, is_good, msg = self.current_exercise.process_frame(results.pose_landmarks.landmark, h, w)
+
+                # Head-Boundary Guard (VISUAL WARNING ONLY - No longer breaks the state machine)
+                if nose.visibility > 0.5 and nose.y < 0.10:
+                    is_good = False
+                    # Appends the step back warning while keeping calibration text visible
+                    msg = "STEP BACK! " + (msg if msg else "")
 
                 if angle is not None:
                     self.csv_writer.writerow([time.time(), round(angle, 2), self.current_exercise.stage, is_good, msg])
-                    color = (0, 255, 0) if is_good else (255, 0, 0)  # RGB format for Tkinter rendering
+                    color = (0, 255, 0) if is_good else (255, 0, 0)
                     cv2.putText(img_rgb, f"{int(angle)} deg", tuple(np.multiply(joint_pos, [1, 1]).astype(int)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
+
+                # --- ON-SCREEN TEXT OVERLAY ---
+                if msg:
+                    cv2.putText(img_rgb, msg, (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3, cv2.LINE_AA)
 
                 # Update UI Dashboard Labels
                 self.lbl_reps.config(text=f"Reps: {self.current_exercise.counter}")
@@ -345,8 +378,10 @@ class PhysioApp:
             self.video_label.imgtk = img_tk
             self.video_label.configure(image=img_tk)
 
-        # Loop the function every 10 milliseconds
-        self.root.after(10, self.update_frame)
+        # Dynamic Frame Scheduling
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        delay = max(1, 33 - elapsed_ms)
+        self.root.after(delay, self.update_frame)
 
     def stop_tracking(self):
         if self.cap:

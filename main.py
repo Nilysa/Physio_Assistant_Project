@@ -1,5 +1,7 @@
 import cv2
 import csv
+import datetime
+import logging
 import os
 import queue
 import threading
@@ -18,6 +20,12 @@ from PIL import Image, ImageTk
 mp_pose = mp.solutions.pose
 mp_draw = mp.solutions.drawing_utils
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+)
+logger = logging.getLogger("physio_assistant")
+
 # Colors are specified in RGB (the frame is converted to RGB before any
 # drawing happens) even though OpenCV normally expects BGR. Naming them
 # explicitly avoids relying on the "red/green are symmetric" coincidence.
@@ -26,6 +34,7 @@ COLOR_BAD_RGB = (231, 76, 60)     # red
 
 SESSIONS_DIR = "sessions"
 CSV_FLUSH_EVERY_N_FRAMES = 15
+TARGET_FPS = 30.0
 
 
 # ==========================================
@@ -39,7 +48,7 @@ class ElbowFlexionConfig:
     elbow_z_max: float = 0.30              # max |elbow.z - shoulder.z| before flagging arm swinging out of plane
     pinned_elbow_max_angle_deg: float = 20.0  # max deviation from vertical for the upper arm to count as "pinned"
     trunk_sway_max_ratio: float = 0.20     # max horizontal shoulder/hip offset, as a fraction of torso length
-    error_display_seconds: float = 1.5     # how long an error message stays on screen once triggered
+    error_display_min_seconds: float = 1.5  # minimum time an error message stays up once triggered, even if fixed sooner
     calib_extension_frames: int = 90       # ~3s at 30fps to lock in the extension baseline
     calib_transition_frames: int = 45      # ~1.5s pause between calibration phases
     calib_flex_frames: int = 60            # ~2s hold to lock in the flexion baseline
@@ -47,6 +56,7 @@ class ElbowFlexionConfig:
     flexion_angle_max_deg: float = 60.0
     min_visibility_tracking: float = 0.4
     min_visibility_calibration: float = 0.7
+    smoothing_time_constant_s: float = 0.15  # EMA time constant (tau); replaces a fixed per-frame alpha
 
 
 # ==========================================
@@ -57,7 +67,8 @@ class BaseExercise:
         self.counter = 0
         self.stage = "extended"
         self.smoothed_angle = None
-        self.smoothing_factor = 0.2
+        self.smoothing_time_constant_s = 0.15
+        self._last_update_time = None
 
     def calculate_angle(self, a, b, c):
         a = np.array(a)
@@ -76,6 +87,24 @@ class BaseExercise:
         angle = np.arccos(cosine_angle)
         return np.degrees(angle)
 
+    def _update_smoothed_angle(self, raw_angle):
+        """
+        Exponential moving average with a time-constant (tau) rather than a
+        fixed per-frame alpha, so smoothing behavior stays consistent even
+        if frames are dropped or the loop briefly lags (alpha would
+        otherwise implicitly assume a fixed dt between updates).
+        """
+        now = time.monotonic()
+        if self.smoothed_angle is None or self._last_update_time is None:
+            self.smoothed_angle = raw_angle
+        else:
+            dt = max(now - self._last_update_time, 0.0)
+            tau = max(self.smoothing_time_constant_s, 1e-6)
+            alpha = 1.0 - np.exp(-dt / tau)
+            self.smoothed_angle = (alpha * raw_angle) + ((1 - alpha) * self.smoothed_angle)
+        self._last_update_time = now
+        return self.smoothed_angle
+
     def process_frame(self, landmarks, h, w):
         raise NotImplementedError("Subclasses must implement this method")
 
@@ -84,11 +113,18 @@ class BaseExercise:
 # 3. SPECIFIC EXERCISE CLASS (ELBOW FLEXION)
 # ==========================================
 class ElbowFlexion(BaseExercise):
+    # Human-readable label + CSV/session filename slug, used by the
+    # exercise registry below so the GUI and file naming stay in sync
+    # with whatever exercises are registered.
+    display_name = "Elbow Flexion"
+    slug = "elbow_flexion"
+
     def __init__(self, side="right", config: ElbowFlexionConfig = None):
         super().__init__()
         self.stage = "calibration_start"
         self.side = side.lower()
         self.cfg = config or ElbowFlexionConfig()
+        self.smoothing_time_constant_s = self.cfg.smoothing_time_constant_s
 
         self.baseline_upper_ratio = 0.0
         self.baseline_forearm_ratio = 0.0
@@ -139,12 +175,7 @@ class ElbowFlexion(BaseExercise):
             hip = [t_hip.x * w, t_hip.y * h]
 
             raw_angle = self.calculate_angle(shoulder, elbow, wrist)
-
-            if self.smoothed_angle is None:
-                self.smoothed_angle = raw_angle
-            else:
-                self.smoothed_angle = (self.smoothing_factor * raw_angle) + (
-                        (1 - self.smoothing_factor) * self.smoothed_angle)
+            self._update_smoothed_angle(raw_angle)
 
             upper_arm_length = np.linalg.norm(np.array(shoulder) - np.array(elbow))
             forearm_length = np.linalg.norm(np.array(elbow) - np.array(wrist))
@@ -243,28 +274,34 @@ class ElbowFlexion(BaseExercise):
                     self.stage_before_error = self.stage
                     self.stage = "error"
 
+                # Re-evaluate the specific cause every frame while form is
+                # bad, so the message reflects the *current* problem
+                # instead of freezing on whatever tripped first.
+                if not is_side_profile:
+                    self.active_error_msg = "TURN TO SIDE!"
+                elif not is_elbow_pinned:
+                    self.active_error_msg = "KEEP ELBOW PINNED!"
+                elif not is_in_plane:
+                    self.active_error_msg = "ARM SWINGING OUT!"
+                elif not is_trunk_stable:
+                    self.active_error_msg = "TRUNK SWAY!"
+                else:
+                    self.active_error_msg = "INCORRECT FORM!"
+
                 if self.error_timer_start is None:
-                    self.error_timer_start = time.time()
-                    if not is_side_profile:
-                        self.active_error_msg = "TURN TO SIDE!"
-                    elif not is_elbow_pinned:
-                        self.active_error_msg = "KEEP ELBOW PINNED!"
-                    elif not is_in_plane:
-                        self.active_error_msg = "ARM SWINGING OUT!"
-                    elif not is_trunk_stable:
-                        self.active_error_msg = "TRUNK SWAY!"
-                    else:
-                        self.active_error_msg = "INCORRECT FORM!"
+                    self.error_timer_start = time.monotonic()
             elif self.stage == "error":
-                # Good form has returned -- resume rep tracking from
-                # wherever the user was before the error instead of
-                # silently requiring a full extension first.
+                # Good form has returned. Keep showing the error banner
+                # for at least error_display_min_seconds so it doesn't
+                # flicker, but resume rep tracking from wherever the user
+                # was before the error instead of requiring a full
+                # extension first.
                 self.stage = self.stage_before_error or "extended"
                 self.stage_before_error = None
 
             if self.error_timer_start is not None:
                 feedback_msg = self.active_error_msg
-                if (time.time() - self.error_timer_start) > cfg.error_display_seconds:
+                if good_form and (time.monotonic() - self.error_timer_start) > cfg.error_display_min_seconds:
                     self.error_timer_start = None
 
             # ==========================================
@@ -274,7 +311,7 @@ class ElbowFlexion(BaseExercise):
                 if self.smoothed_angle > self.target_ext and is_wrist_down:
                     if self.stage == 'flexed':
                         self.counter += 1
-                        print(f"Rep completed! Total: {self.counter}")
+                        logger.info("Rep completed! Total: %d", self.counter)
                     self.stage = "extended"
 
                 elif self.smoothed_angle < self.target_flex and self.stage == 'extended':
@@ -289,6 +326,14 @@ class ElbowFlexion(BaseExercise):
             return None, None, False, "Stand fully in frame!"
 
 
+# Registry mapping a stable slug -> exercise class, so the GUI and file
+# naming can stay data-driven instead of hardcoding a single exercise.
+# Add new BaseExercise subclasses here to extend the app.
+EXERCISE_REGISTRY = {
+    ElbowFlexion.slug: ElbowFlexion,
+}
+
+
 # ==========================================
 # 4. BACKGROUND VIDEO/POSE WORKER
 # ==========================================
@@ -301,37 +346,61 @@ class VideoWorker(threading.Thread):
     results it puts on `result_queue`.
     """
 
-    def __init__(self, side, csv_path, result_queue, config: ElbowFlexionConfig = None):
+    def __init__(self, side, csv_path, result_queue, config: ElbowFlexionConfig = None,
+                 exercise_cls=ElbowFlexion, model_complexity=1):
         super().__init__(daemon=True)
         self.result_queue = result_queue
-        self.exercise = ElbowFlexion(side=side, config=config)
+        self.exercise = exercise_cls(side=side, config=config)
         self.csv_path = csv_path
+        self.model_complexity = model_complexity
         self._stop_event = threading.Event()
+        self._camera_ready = threading.Event()
         self._error = None
 
     def stop(self):
         self._stop_event.set()
+
+    def wait_until_stopped(self, timeout=None):
+        """
+        Blocks until the thread has actually finished (camera released,
+        pose model closed, CSV file closed) rather than just until
+        `join()` times out. Returns True if the thread is confirmed dead.
+        """
+        self.join(timeout=timeout)
+        return not self.is_alive()
 
     def run(self):
         cap = None
         pose = None
         csv_file = None
         try:
-            cap = cv2.VideoCapture(0)
+            # Backend hints speed up camera init on Windows/Linux; falls
+            # back to the default backend automatically if unsupported.
+            if sys.platform.startswith("win"):
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            elif sys.platform.startswith("linux"):
+                cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+            else:
+                cap = cv2.VideoCapture(0)
+
             if not cap.isOpened():
                 self._push_error("Could not open camera.")
                 return
 
-            pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+            pose = mp_pose.Pose(
+                model_complexity=self.model_complexity,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
 
             os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
             csv_file = open(self.csv_path, mode='w', newline='')
             csv_writer = csv.writer(csv_file)
-            csv_writer.writerow(["Timestamp", "Smoothed_Angle", "Stage", "Good_Form", "Feedback"])
+            csv_writer.writerow(["Timestamp_ISO", "Smoothed_Angle", "Stage", "Good_Form", "Feedback"])
             frames_since_flush = 0
 
             while not self._stop_event.is_set():
-                loop_start = time.time()
+                loop_start = time.monotonic()
 
                 success, img = cap.read()
                 if not success:
@@ -367,7 +436,8 @@ class VideoWorker(threading.Thread):
                     counter = self.exercise.counter
 
                     if angle is not None:
-                        csv_writer.writerow([time.time(), round(angle, 2), stage, is_good, msg])
+                        timestamp_iso = datetime.datetime.now().isoformat(timespec="milliseconds")
+                        csv_writer.writerow([timestamp_iso, round(angle, 2), stage, is_good, msg])
                         frames_since_flush += 1
                         if frames_since_flush >= CSV_FLUSH_EVERY_N_FRAMES:
                             csv_file.flush()
@@ -382,14 +452,17 @@ class VideoWorker(threading.Thread):
 
                 self._push_result(img_rgb, counter, stage, msg, is_good)
 
-                # Pace the loop to roughly 30fps without busy-waiting.
-                elapsed = time.time() - loop_start
-                remaining = (1.0 / 30.0) - elapsed
+                # Pace the loop to roughly TARGET_FPS without busy-waiting.
+                # monotonic() is immune to wall-clock jumps (NTP sync, DST)
+                # that time.time() is exposed to.
+                elapsed = time.monotonic() - loop_start
+                remaining = (1.0 / TARGET_FPS) - elapsed
                 if remaining > 0:
                     time.sleep(remaining)
 
-        except Exception as exc:  # noqa: BLE001 - surface any failure to the UI instead of dying silently
-            self._push_error(f"Camera/pose error: {exc}")
+        except Exception:
+            logger.exception("Camera/pose worker crashed")
+            self._push_error("Camera/pose error - check logs for details.")
         finally:
             if cap is not None:
                 cap.release()
@@ -403,11 +476,24 @@ class VideoWorker(threading.Thread):
         l_ear = landmarks[mp_pose.PoseLandmark.LEFT_EAR.value]
         r_ear = landmarks[mp_pose.PoseLandmark.RIGHT_EAR.value]
 
-        if nose.visibility > 0.5:
-            nx, ny = int(nose.x * w), int(nose.y * h)
+        if nose.visibility <= 0.5:
+            return
+
+        nx, ny = int(nose.x * w), int(nose.y * h)
+
+        # Only trust the ear-derived radius if both ears are actually
+        # visible -- otherwise MediaPipe can still return a stale/low-
+        # confidence coordinate for an occluded ear, which would silently
+        # produce a wrongly-sized (or misplaced) mask and risk exposing
+        # part of the face. Fall back to a fixed radius in that case.
+        ears_visible = l_ear.visibility > 0.5 and r_ear.visibility > 0.5
+        if ears_visible:
             ear_dist = abs(l_ear.x - r_ear.x) * w
             dynamic_radius = int(ear_dist * 1.5) if ear_dist > 0 else int(h * 0.08)
-            cv2.circle(img_rgb, (nx, ny), dynamic_radius, (25, 25, 25), -1)
+        else:
+            dynamic_radius = int(h * 0.08)
+
+        cv2.circle(img_rgb, (nx, ny), dynamic_radius, (25, 25, 25), -1)
 
     def _push_result(self, img_rgb, counter, stage, msg, is_good):
         # Keep only the freshest frame -- if the UI hasn't consumed the
@@ -439,6 +525,7 @@ class VideoWorker(threading.Thread):
 # ==========================================
 class PhysioApp:
     POLL_INTERVAL_MS = 15
+    WORKER_JOIN_TIMEOUT_S = 2.0
 
     def __init__(self, root):
         self.root = root
@@ -449,6 +536,10 @@ class PhysioApp:
         self.worker = None
         self.result_queue = queue.Queue(maxsize=2)
         self._poll_job = None
+        # True while a worker thread is being shut down but hasn't been
+        # confirmed dead yet -- blocks starting a new session so two
+        # threads never race for the same camera device.
+        self._stopping = False
 
         # Build UI Frames
         self.main_menu_frame = tk.Frame(self.root, bg="#2C3E50")
@@ -470,13 +561,17 @@ class PhysioApp:
         tk.Label(self.main_menu_frame, text="Select Exercise Protocol", font=btn_font, fg="#BDC3C7", bg="#2C3E50").pack(
             pady=10)
 
+        self.status_label = tk.Label(self.main_menu_frame, text="", font=font.Font(family="Helvetica", size=11),
+                                      fg="#E74C3C", bg="#2C3E50")
+        self.status_label.pack(pady=(0, 10))
+
         tk.Button(self.main_menu_frame, text="Elbow Flexion (Right Arm)", font=btn_font, bg="#2980B9", fg="white",
                   width=30, height=2,
-                  command=lambda: self.start_tracking("right")).pack(pady=10)
+                  command=lambda: self.start_tracking("elbow_flexion", "right")).pack(pady=10)
 
         tk.Button(self.main_menu_frame, text="Elbow Flexion (Left Arm)", font=btn_font, bg="#2980B9", fg="white",
                   width=30, height=2,
-                  command=lambda: self.start_tracking("left")).pack(pady=10)
+                  command=lambda: self.start_tracking("elbow_flexion", "left")).pack(pady=10)
 
     def build_tracking_dashboard(self):
         self.video_label = tk.Label(self.tracking_frame, bg="black")
@@ -501,12 +596,20 @@ class PhysioApp:
                              fg="white", width=15, command=self.stop_tracking)
         btn_stop.pack(side="bottom", pady=40)
 
-    def start_tracking(self, side):
+    def start_tracking(self, exercise_slug, side):
+        if self.worker is not None or self._stopping:
+            self.status_label.config(text="Previous session is still shutting down, please wait...")
+            return
+
+        exercise_cls = EXERCISE_REGISTRY[exercise_slug]
+        self.status_label.config(text="")
+
         self.main_menu_frame.pack_forget()
         self.tracking_frame.pack(fill="both", expand=True)
 
         session_id = int(time.time())
-        csv_path = os.path.join(SESSIONS_DIR, f"session_data_{session_id}.csv")
+        csv_name = f"session_{exercise_slug}_{side}_{session_id}.csv"
+        csv_path = os.path.join(SESSIONS_DIR, csv_name)
 
         # Drain any stale results from a previous session.
         while not self.result_queue.empty():
@@ -515,7 +618,8 @@ class PhysioApp:
             except queue.Empty:
                 break
 
-        self.worker = VideoWorker(side=side, csv_path=csv_path, result_queue=self.result_queue)
+        self.worker = VideoWorker(side=side, csv_path=csv_path, result_queue=self.result_queue,
+                                   exercise_cls=exercise_cls)
         self.worker.start()
 
         self._poll_job = self.root.after(self.POLL_INTERVAL_MS, self._poll_results)
@@ -550,12 +654,40 @@ class PhysioApp:
             self._poll_job = None
 
         if self.worker is not None:
-            self.worker.stop()
-            self.worker.join(timeout=2.0)
-            self.worker = None
+            worker = self.worker
+            self._stopping = True
+            worker.stop()
+
+            confirmed_dead = worker.wait_until_stopped(timeout=self.WORKER_JOIN_TIMEOUT_S)
+            if confirmed_dead:
+                self.worker = None
+                self._stopping = False
+            else:
+                # Thread didn't die in time (camera/pose call stuck). Keep
+                # a background watcher polling instead of discarding the
+                # reference -- discarding it here would let a user start a
+                # new session while the old thread still holds the camera
+                # device, causing an open failure or corrupted frames.
+                logger.warning("Worker thread did not stop within timeout; waiting in background.")
+                self._await_worker_shutdown(worker)
 
         self.tracking_frame.pack_forget()
         self.main_menu_frame.pack(fill="both", expand=True)
+
+    def _await_worker_shutdown(self, worker, attempt=0):
+        if not worker.is_alive():
+            if self.worker is worker:
+                self.worker = None
+            self._stopping = False
+            self.status_label.config(text="")
+            logger.info("Previous worker thread confirmed stopped.")
+            return
+
+        if attempt == 0:
+            self.status_label.config(text="Releasing camera from previous session...")
+
+        # Keep checking without blocking the GUI thread.
+        self.root.after(200, lambda: self._await_worker_shutdown(worker, attempt + 1))
 
     def on_close(self):
         self.stop_tracking()

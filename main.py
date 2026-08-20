@@ -42,6 +42,7 @@ class AppConfig:
     target_fps: float = 30.0
     queue_max_size: int = 1
 
+
 @dataclass
 class BaseExerciseConfig:
     error_display_min_seconds: float = 1.5
@@ -52,6 +53,7 @@ class BaseExerciseConfig:
     min_visibility_tracking: float = 0.4
     min_visibility_calibration: float = 0.7
     smoothing_time_constant_s: float = 0.15
+
 
 @dataclass
 class ElbowFlexionConfig(BaseExerciseConfig):
@@ -65,6 +67,7 @@ class ElbowFlexionConfig(BaseExerciseConfig):
     z_stability_ratio: float = 0.75
     stability_ratio: float = 0.75
 
+
 @dataclass
 class ShoulderAbductionConfig(BaseExerciseConfig):
     frontal_profile_min_shoulder_ratio: float = 0.40
@@ -72,7 +75,7 @@ class ShoulderAbductionConfig(BaseExerciseConfig):
     wrist_z_max_diff: float = 0.40
     trunk_sway_max_ratio: float = 0.08
     extension_angle_max_deg: float = 30.0
-    shrug_max_ratio: float = 0.08       # NEW: 8% drop in Nose-to-Shoulder distance
+    shrug_max_ratio: float = 0.12  # FIXED: Relaxed to 12% for asymmetry
     min_rom_deg: float = 20.0
     flex_buffer_deg: float = 10.0
     stability_ratio: float = 0.75
@@ -152,18 +155,28 @@ class BaseExercise:
             self.error_timer_start = time.monotonic()
 
         feedback_msg = ""
+        ui_is_good = is_good_form  # Decouple the UI color from the physics engine
+
         if self.stage == "error":
             feedback_msg = self.active_error_msg
+            ui_is_good = False
         elif self.error_timer_start is not None:
             feedback_msg = self.active_error_msg
+            ui_is_good = False
             if is_good_form and (time.monotonic() - self.error_timer_start) > self.cfg.error_display_min_seconds:
                 self.error_timer_start = None
                 self.active_error_msg = ""
 
+        # NEW: Explicit UI feedback for the recovering state
+        if self.stage == "recovering" and feedback_msg == "":
+            feedback_msg = "REP VOIDED: RETURN TO START"
+            ui_is_good = False  # Keep the text red so the patient notices the instruction
+
+        # Let the physics engine run so the state machine can transition out of 'recovering'
         if is_good_form:
             self._update_rep_counter()
 
-        return self.smoothed_angle, joint_pos, is_good_form, feedback_msg
+        return self.smoothed_angle, joint_pos, ui_is_good, feedback_msg
 
     def _get_primary_kinematics(self, landmarks, h, w):
         raise NotImplementedError
@@ -213,7 +226,7 @@ class ElbowFlexion(BaseExercise):
                                                                                    idx.LEFT_WRIST, idx.LEFT_HIP)
         opp_s_idx = idx.LEFT_SHOULDER if self.side == "right" else idx.RIGHT_SHOULDER
         t_shoulder, t_elbow, t_wrist, t_hip = landmarks[s_idx.value], landmarks[e_idx.value], landmarks[w_idx.value], \
-        landmarks[h_idx.value]
+            landmarks[h_idx.value]
 
         shoulder = [t_shoulder.x * w, t_shoulder.y * h]
         elbow = [t_elbow.x * w, t_elbow.y * h]
@@ -275,14 +288,12 @@ class ElbowFlexion(BaseExercise):
             return err_msg
 
         if self.stage == "calibration_start":
-            # 1. Check Angle FIRST to prevent flicker
             if self.smoothed_angle < self.cfg.extension_angle_min_deg:
                 self._calib_start_time = None
                 self._calib_sums = {k: 0.0 for k in self._calib_sums}
                 self._calib_sample_count = 0
                 return "DROP ARM STRAIGHT TO START"
 
-            # 2. Check Velocity SECOND
             h_idx = idx.RIGHT_HIP if self.side == "right" else idx.LEFT_HIP
             hip = [landmarks[h_idx.value].x * w, landmarks[h_idx.value].y * h]
             torso_len = max(np.linalg.norm(np.array(current_shoulder) - np.array(hip)), 1e-6)
@@ -423,13 +434,23 @@ class ShoulderAbduction(BaseExercise):
 
         if self.stage.startswith("calib"): return True, ""
 
-        # Priority 2: Posture (Sway)
-        current_trunk_x_ratio = abs(shoulder[0] - hip[0]) / torso_length
+        # Priority 2: Posture (Sway - FIXED utilizing Nose-to-Hip for true spinal tilt)
+        current_trunk_x_ratio = abs(nose[0] - hip[0]) / torso_length
         sway_limit = self.baselines['trunk_x_ratio'] + self.cfg.trunk_sway_max_ratio
         if current_trunk_x_ratio > sway_limit:
             return False, "KEEP TORSO STRAIGHT!"
 
-        # Priority 3: Posture (Shrug - NEW MATH utilizing Nose-to-Shoulder distance)
+        # Priority 3: Arm Vectors (Foreshortening & Z-axis Guard)
+        # MOVED UP: Prevents "Error Shadowing". Forward arm causes false shrugs.
+        upper_len = np.linalg.norm(np.array(shoulder) - np.array(elbow))
+        upper_ratio = upper_len / torso_length
+        if upper_ratio < (self.baselines.get('upper_ratio', 0) * self.cfg.stability_ratio):
+            return False, "LIFT TO THE SIDE, NOT FORWARD!"
+
+        if abs(t_elbow.z - t_shoulder.z) > self.cfg.elbow_z_max_diff:
+            return False, "LIFT TO THE SIDE, NOT FORWARD!"
+
+        # Priority 4: Posture (Shrug - NEW MATH utilizing Nose-to-Shoulder distance)
         raw_shrug_ratio = abs(shoulder[1] - nose[1]) / torso_length
         now = time.monotonic()
         if self.smoothed_shrug_ratio is None or self._last_shrug_time is None:
@@ -445,15 +466,6 @@ class ShoulderAbduction(BaseExercise):
         shrug_limit = self.baselines['shrug_ratio'] - self.cfg.shrug_max_ratio
         if self.smoothed_shrug_ratio < shrug_limit:
             return False, "RELAX SHOULDER, DO NOT SHRUG!"
-
-        # Priority 4: Arm Vectors (Foreshortening & Z-axis Guard)
-        upper_len = np.linalg.norm(np.array(shoulder) - np.array(elbow))
-        upper_ratio = upper_len / torso_length
-        if upper_ratio < (self.baselines.get('upper_ratio', 0) * self.cfg.stability_ratio):
-            return False, "LIFT TO THE SIDE, NOT FORWARD!"
-
-        if abs(t_elbow.z - t_shoulder.z) > self.cfg.elbow_z_max_diff:
-            return False, "LIFT TO THE SIDE, NOT FORWARD!"
 
         return True, ""
 
@@ -477,14 +489,12 @@ class ShoulderAbduction(BaseExercise):
             return err_msg
 
         if self.stage == "calibration_start":
-            # 1. Check Angle FIRST to prevent flicker
             if self.smoothed_angle > self.cfg.extension_angle_max_deg:
                 self._calib_start_time = None
                 self._calib_sums = {k: 0.0 for k in self._calib_sums}
                 self._calib_sample_count = 0
                 return "DROP ARM STRAIGHT DOWN"
 
-            # 2. Check Velocity SECOND
             h_idx = idx.RIGHT_HIP if self.side == "right" else idx.LEFT_HIP
             hip = [landmarks[h_idx.value].x * w, landmarks[h_idx.value].y * h]
             torso_length = max(np.linalg.norm(np.array(current_shoulder) - np.array(hip)), 1e-6)
@@ -505,7 +515,9 @@ class ShoulderAbduction(BaseExercise):
 
             self._calib_sums['angle'] += self.smoothed_angle
             self._calib_sums['shrug_ratio'] += abs(current_shoulder[1] - nose[1]) / torso_length
-            self._calib_sums['trunk_x_ratio'] += abs(current_shoulder[0] - hip[0]) / torso_length
+
+            # FIXED: Anchor baseline sway to the Nose instead of the Shoulder
+            self._calib_sums['trunk_x_ratio'] += abs(nose[0] - hip[0]) / torso_length
 
             upper_len = np.linalg.norm(np.array(current_shoulder) - np.array(elbow))
             self._calib_sums['upper_ratio'] += upper_len / torso_length
@@ -583,7 +595,8 @@ EXERCISE_REGISTRY = {
 # 6. BACKGROUND VIDEO/POSE WORKER
 # ==========================================
 class VideoWorker(threading.Thread):
-    def __init__(self, side, csv_path, result_queue, app_cfg: AppConfig, config=None, exercise_cls=ElbowFlexion, model_complexity=1):
+    def __init__(self, side, csv_path, result_queue, app_cfg: AppConfig, config=None, exercise_cls=ElbowFlexion,
+                 model_complexity=1):
         super().__init__(daemon=True)
         self.app_cfg = app_cfg
         self.result_queue = result_queue
@@ -625,14 +638,22 @@ class VideoWorker(threading.Thread):
             csv_file = open(self.csv_path, mode='w', newline='')
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow(["Timestamp_ISO", "Smoothed_Angle", "Stage", "Good_Form", "Feedback"])
+
             frames_since_flush = 0
+            failed_reads = 0  # NEW: Track consecutive camera read failures
 
             while not self._stop_event.is_set():
                 loop_start = time.monotonic()
                 success, img = cap.read()
                 if not success:
+                    failed_reads += 1
+                    if failed_reads > 50:  # Roughly 2.5 seconds of dead camera feed
+                        self._push_error("Camera disconnected or feed lost.")
+                        break
                     time.sleep(0.05)
                     continue
+
+                failed_reads = 0  # Reset counter when successful
 
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 h, w, _ = img.shape
@@ -677,6 +698,11 @@ class VideoWorker(threading.Thread):
 
                     if msg:
                         cv2.putText(img_rgb, msg, (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_BAD_RGB, 3, cv2.LINE_AA)
+
+                else:
+                    # NEW: Explicitly handle the case when nobody is detected in the frame
+                    is_good = False
+                    msg = "NO PERSON DETECTED"
 
                 self._push_result(img_rgb, counter, stage, msg, is_good)
 

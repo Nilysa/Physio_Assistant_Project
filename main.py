@@ -260,11 +260,14 @@ class ElbowFlexion(BaseExercise):
         if (wrist_z_diff > w_lim or elbow_z_diff > e_lim) or not (is_upper_stable and is_forearm_stable):
             return False, "ARM SWINGING OUT!"
 
+        # Priority 1: Posture (Root Cause)
+        if abs(shoulder[0] - hip[0]) > (self.cfg.trunk_sway_max_ratio * torso_length):
+            return False, "TRUNK SWAY!"
+
+        # Priority 2: Limb Vectors (Symptoms)
         if np.degrees(np.arctan2(abs(elbow[0] - shoulder[0]),
                                  max(elbow[1] - shoulder[1], 1))) > self.cfg.pinned_elbow_max_angle_deg:
             return False, "KEEP ELBOW PINNED!"
-        if abs(shoulder[0] - hip[0]) > (self.cfg.trunk_sway_max_ratio * torso_length):
-            return False, "TRUNK SWAY!"
 
         return True, ""
 
@@ -538,7 +541,7 @@ class ShoulderAbduction(BaseExercise):
             if self._calib_transition_start_time is None: self._calib_transition_start_time = now
             if (now - self._calib_transition_start_time) > self.cfg.calib_transition_seconds:
                 self.stage = "calibration_flex"
-            return "SUCCESS! NOW RAISE ARM TO THE SIDE..."
+            return "SUCCESS! NOW RAISE ARM..."
 
         elif self.stage == "calibration_flex":
             if self._calib_flex_start_time is None: self._calib_flex_start_time = now
@@ -671,7 +674,19 @@ class VideoWorker(threading.Thread):
 
                 if results.pose_landmarks:
                     self._mask_face(results.pose_landmarks.landmark, img_rgb, h, w)
+
+                    # --- NEW FIX: Erase face dots before drawing the skeleton ---
+                    # We save the nose visibility first because the "STEP BACK!" check needs it later
+                    original_nose_vis = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value].visibility
+
+                    for i in range(11):  # Landmarks 0 through 10 are the face
+                        results.pose_landmarks.landmark[i].visibility = 0.0
+
                     mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+                    # Restore the nose visibility for the physics engine
+                    results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value].visibility = original_nose_vis
+                    # -----------------------------------------------------------
 
                     angle, joint_pos, is_good, msg = self.exercise.process_frame(results.pose_landmarks.landmark, h, w)
 
@@ -728,22 +743,30 @@ class VideoWorker(threading.Thread):
                 pose.close()
 
     def _mask_face(self, landmarks, img_rgb, h, w):
-        nose = landmarks[mp_pose.PoseLandmark.NOSE.value]
-        l_ear = landmarks[mp_pose.PoseLandmark.LEFT_EAR.value]
-        r_ear = landmarks[mp_pose.PoseLandmark.RIGHT_EAR.value]
+        # Landmarks 0 through 10 represent all facial features in MediaPipe
+        face_x = []
+        face_y = []
 
-        if nose.visibility <= 0.5:
+        for i in range(11):
+            lm = landmarks[i]
+            # If the landmark is even slightly visible, grab its coordinates
+            if lm.visibility > 0.1:
+                face_x.append(lm.x * w)
+                face_y.append(lm.y * h)
+
+        # If we couldn't find ANY face landmarks, bail out safely
+        if not face_x:
             return
 
-        nx, ny = int(nose.x * w), int(nose.y * h)
-        ears_visible = l_ear.visibility > 0.5 and r_ear.visibility > 0.5
-        if ears_visible:
-            ear_dist = abs(l_ear.x - r_ear.x) * w
-            dynamic_radius = int(ear_dist * 1.5) if ear_dist > 0 else int(h * 0.08)
-        else:
-            dynamic_radius = int(h * 0.08)
+        # Calculate the exact center of whatever face parts ARE visible
+        cx = int(sum(face_x) / len(face_x))
+        cy = int(sum(face_y) / len(face_y))
 
-        cv2.circle(img_rgb, (nx, ny), dynamic_radius, (25, 25, 25), -1)
+        # Lock the radius to 12% of the screen height (large enough to cover a side-profile head)
+        dynamic_radius = int(h * 0.12)
+
+        # Draw the solid mask
+        cv2.circle(img_rgb, (cx, cy), dynamic_radius, (25, 25, 25), -1)
 
     def _push_result(self, img_rgb, counter, stage, msg, is_good):
         try:

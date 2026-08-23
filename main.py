@@ -75,7 +75,7 @@ class ShoulderAbductionConfig(BaseExerciseConfig):
     wrist_z_max_diff: float = 0.40
     trunk_sway_max_ratio: float = 0.08
     extension_angle_max_deg: float = 30.0
-    shrug_max_ratio: float = 0.12  # FIXED: Relaxed to 12% for asymmetry
+    shrug_max_ratio: float = 0.12
     min_rom_deg: float = 20.0
     flex_buffer_deg: float = 10.0
     stability_ratio: float = 0.75
@@ -103,7 +103,7 @@ class BaseExercise:
         self._calib_flex_hold_start_time = None
         self._calib_sample_count = 0
 
-        # New: Flexion Hold Accumulators
+        # Flexion Hold Accumulators
         self._calib_flex_sums = 0.0
         self._calib_flex_count = 0
 
@@ -155,22 +155,18 @@ class BaseExercise:
             self.error_timer_start = time.monotonic()
 
         feedback_msg = ""
-        ui_is_good = is_good_form  # Decouple the UI color from the physics engine
+        ui_is_good = is_good_form
 
         if self.stage == "error":
-            feedback_msg = self.active_error_msg
+            feedback_msg = f"{self.active_error_msg} (VOIDED)"
             ui_is_good = False
-        elif self.error_timer_start is not None:
-            feedback_msg = self.active_error_msg
+        elif self.stage == "recovering":
             ui_is_good = False
-            if is_good_form and (time.monotonic() - self.error_timer_start) > self.cfg.error_display_min_seconds:
-                self.error_timer_start = None
-                self.active_error_msg = ""
-
-        # NEW: Explicit UI feedback for the recovering state
-        if self.stage == "recovering" and feedback_msg == "":
-            feedback_msg = "REP VOIDED: RETURN TO START"
-            ui_is_good = False  # Keep the text red so the patient notices the instruction
+            if self.error_timer_start is not None and (
+                    time.monotonic() - self.error_timer_start) < self.cfg.error_display_min_seconds:
+                feedback_msg = f"{self.active_error_msg} (VOIDED)"
+            else:
+                feedback_msg = "RETURN TO START TO RESET"
 
         # Let the physics engine run so the state machine can transition out of 'recovering'
         if is_good_form:
@@ -202,6 +198,10 @@ class ElbowFlexion(BaseExercise):
         super().__init__(side, config or ElbowFlexionConfig())
         self.baselines = {'wrist_z': 0.0, 'elbow_z': 0.0, 'upper_ratio': 0.0, 'forearm_ratio': 0.0}
         self._calib_sums = {'wrist_z': 0.0, 'elbow_z': 0.0, 'upper_ratio': 0.0, 'forearm_ratio': 0.0, 'angle': 0.0}
+
+        # New smoothing structure for secondary kinematic signals
+        self.smoothed = {'wrist_z': None, 'elbow_z': None, 'upper_ratio': None, 'forearm_ratio': None}
+        self._last_smooth_time = None
 
     def _get_primary_kinematics(self, landmarks, h, w):
         req_vis = self.cfg.min_visibility_calibration if self.stage.startswith(
@@ -237,37 +237,59 @@ class ElbowFlexion(BaseExercise):
         torso_length = max(np.linalg.norm(np.array(shoulder) - np.array(hip)), 1e-6)
         shoulder_width = abs(shoulder[0] - opp_shoulder[0])
 
+        upper_len = np.linalg.norm(np.array(shoulder) - np.array(elbow))
+        forearm_len = np.linalg.norm(np.array(elbow) - np.array(wrist))
+
+        # Apply EMA smoothing to noisy Z and Ratio constraints
+        now = time.monotonic()
+        raw_signals = {
+            'wrist_z': abs(t_wrist.z - t_shoulder.z),
+            'elbow_z': abs(t_elbow.z - t_shoulder.z),
+            'upper_ratio': upper_len / torso_length,
+            'forearm_ratio': forearm_len / torso_length
+        }
+
+        if self._last_smooth_time is None or any(v is None for v in self.smoothed.values()):
+            self.smoothed.update(raw_signals)
+        else:
+            dt = max(now - self._last_smooth_time, 0.0)
+            tau = max(self.cfg.smoothing_time_constant_s, 1e-6)
+            alpha = 1.0 - np.exp(-dt / tau)
+            for k in raw_signals:
+                self.smoothed[k] = (alpha * raw_signals[k]) + ((1 - alpha) * self.smoothed[k])
+        self._last_smooth_time = now
+
+        # Priority 1: Profile Alignment
         if shoulder_width > (self.cfg.side_profile_max_shoulder_ratio * torso_length):
             return False, "TURN TO SIDE PROFILE!"
 
         if self.stage.startswith("calib"): return True, ""
 
-        upper_len = np.linalg.norm(np.array(shoulder) - np.array(elbow))
-        forearm_len = np.linalg.norm(np.array(elbow) - np.array(wrist))
-        upper_ratio = upper_len / torso_length
-        forearm_ratio = forearm_len / torso_length
+        # Priority 2: Posture (Root Cause)
+        if abs(shoulder[0] - hip[0]) > (self.cfg.trunk_sway_max_ratio * torso_length):
+            return False, "TRUNK SWAY!"
 
-        is_upper_stable = upper_ratio > (self.baselines['upper_ratio'] * self.cfg.stability_ratio)
-        is_forearm_stable = forearm_ratio > (self.baselines['forearm_ratio'] * self.cfg.stability_ratio)
+        # Priority 3: Limb Vectors (Symptoms)
+        if elbow[1] < shoulder[1]:
+            return False, "KEEP ELBOW PINNED!"
+        if np.degrees(np.arctan2(abs(elbow[0] - shoulder[0]),
+                                 max(elbow[1] - shoulder[1], 1))) > self.cfg.pinned_elbow_max_angle_deg:
+            return False, "KEEP ELBOW PINNED!"
 
-        wrist_z_diff, elbow_z_diff = abs(t_wrist.z - t_shoulder.z), abs(t_elbow.z - t_shoulder.z)
+        # Priority 4: Arm Swinging Out (Uses smoothed variables)
+        is_upper_stable = self.smoothed['upper_ratio'] > (self.baselines['upper_ratio'] * self.cfg.stability_ratio)
+        is_forearm_stable = self.smoothed['forearm_ratio'] > (
+                    self.baselines['forearm_ratio'] * self.cfg.stability_ratio)
+
         z_ratio = self.cfg.z_stability_ratio
         w_lim = max(self.baselines['wrist_z'], self.cfg.wrist_z_max * z_ratio) / z_ratio if self.baselines[
                                                                                                 'wrist_z'] > 0 else self.cfg.wrist_z_max
         e_lim = max(self.baselines['elbow_z'], self.cfg.elbow_z_max * z_ratio) / z_ratio if self.baselines[
                                                                                                 'elbow_z'] > 0 else self.cfg.elbow_z_max
 
-        if (wrist_z_diff > w_lim or elbow_z_diff > e_lim) or not (is_upper_stable and is_forearm_stable):
+        if (self.smoothed['wrist_z'] > w_lim or self.smoothed['elbow_z'] > e_lim) or not (
+                is_upper_stable and is_forearm_stable):
             return False, "ARM SWINGING OUT!"
-
-        # Priority 1: Posture (Root Cause)
-        if abs(shoulder[0] - hip[0]) > (self.cfg.trunk_sway_max_ratio * torso_length):
-            return False, "TRUNK SWAY!"
-
-        # Priority 2: Limb Vectors (Symptoms)
-        if np.degrees(np.arctan2(abs(elbow[0] - shoulder[0]),
-                                 max(elbow[1] - shoulder[1], 1))) > self.cfg.pinned_elbow_max_angle_deg:
-            return False, "KEEP ELBOW PINNED!"
 
         return True, ""
 
@@ -326,6 +348,13 @@ class ElbowFlexion(BaseExercise):
             elapsed = now - self._calib_start_time
             if elapsed >= self.cfg.calib_extension_seconds:
                 n = self._calib_sample_count
+
+                if n < 15:
+                    self._calib_start_time = None
+                    self._calib_sums = {k: 0.0 for k in self._calib_sums}
+                    self._calib_sample_count = 0
+                    return "KEEP BODY FULLY VISIBLE!"
+
                 self.baselines['wrist_z'] = self._calib_sums['wrist_z'] / n
                 self.baselines['elbow_z'] = self._calib_sums['elbow_z'] / n
                 self.baselines['upper_ratio'] = self._calib_sums['upper_ratio'] / n
@@ -357,7 +386,7 @@ class ElbowFlexion(BaseExercise):
                 if elapsed_hold >= self.cfg.calib_flex_seconds:
                     avg_flex = self._calib_flex_sums / self._calib_flex_count
                     self.target_flex = avg_flex + 15
-                    self.stage = "extended"
+                    self.stage = "calibration_returning"
                     return "CALIBRATION COMPLETE!"
 
                 seconds_left = max(0, int(self.cfg.calib_flex_seconds - elapsed_hold) + 1)
@@ -372,6 +401,12 @@ class ElbowFlexion(BaseExercise):
                     self._calib_transition_start_time = None
                     return "TIMEOUT: PLEASE TRY AGAIN"
                 return "BEND ARM PAST MINIMUM LIMIT"
+
+        elif self.stage == "calibration_returning":
+            if self.smoothed_angle > self.target_ext:
+                self.stage = "extended"
+                return "START WORKOUT!"
+            return "RETURN TO START..."
 
     def _update_rep_counter(self):
         if self.smoothed_angle > self.target_ext:
@@ -393,8 +428,9 @@ class ShoulderAbduction(BaseExercise):
         super().__init__(side, config or ShoulderAbductionConfig())
         self.baselines = {'shrug_ratio': 0.0, 'trunk_x_ratio': 0.0, 'upper_ratio': 0.0}
         self._calib_sums = {'angle': 0.0, 'shrug_ratio': 0.0, 'trunk_x_ratio': 0.0, 'upper_ratio': 0.0}
-        self.smoothed_shrug_ratio = None
-        self._last_shrug_time = None
+
+        self.smoothed = {'trunk_x_ratio': None, 'upper_ratio': None, 'elbow_z': None, 'shrug_ratio': None}
+        self._last_smooth_time = None
 
     def _get_primary_kinematics(self, landmarks, h, w):
         req_vis = self.cfg.min_visibility_calibration if self.stage.startswith(
@@ -420,7 +456,7 @@ class ShoulderAbduction(BaseExercise):
         n_idx = mp_pose.PoseLandmark.NOSE
 
         t_shoulder, t_elbow, t_hip, t_nose = landmarks[s_idx.value], landmarks[e_idx.value], landmarks[h_idx.value], \
-        landmarks[n_idx.value]
+            landmarks[n_idx.value]
 
         shoulder = [t_shoulder.x * w, t_shoulder.y * h]
         elbow = [t_elbow.x * w, t_elbow.y * h]
@@ -430,6 +466,25 @@ class ShoulderAbduction(BaseExercise):
 
         torso_length = max(np.linalg.norm(np.array(shoulder) - np.array(hip)), 1e-6)
         shoulder_width = abs(shoulder[0] - opp_shoulder[0])
+        upper_len = np.linalg.norm(np.array(shoulder) - np.array(elbow))
+
+        now = time.monotonic()
+        raw_signals = {
+            'trunk_x_ratio': abs(nose[0] - hip[0]) / torso_length,
+            'upper_ratio': upper_len / torso_length,
+            'elbow_z': abs(t_elbow.z - t_shoulder.z),
+            'shrug_ratio': abs(shoulder[1] - nose[1]) / torso_length
+        }
+
+        if self._last_smooth_time is None or any(v is None for v in self.smoothed.values()):
+            self.smoothed.update(raw_signals)
+        else:
+            dt = max(now - self._last_smooth_time, 0.0)
+            tau = max(self.cfg.smoothing_time_constant_s, 1e-6)
+            alpha = 1.0 - np.exp(-dt / tau)
+            for k in raw_signals:
+                self.smoothed[k] = (alpha * raw_signals[k]) + ((1 - alpha) * self.smoothed[k])
+        self._last_smooth_time = now
 
         # Priority 1: Camera Alignment
         if shoulder_width < (self.cfg.frontal_profile_min_shoulder_ratio * torso_length):
@@ -437,38 +492,22 @@ class ShoulderAbduction(BaseExercise):
 
         if self.stage.startswith("calib"): return True, ""
 
-        # Priority 2: Posture (Sway - FIXED utilizing Nose-to-Hip for true spinal tilt)
-        current_trunk_x_ratio = abs(nose[0] - hip[0]) / torso_length
+        # Priority 2: Posture (Sway)
         sway_limit = self.baselines['trunk_x_ratio'] + self.cfg.trunk_sway_max_ratio
-        if current_trunk_x_ratio > sway_limit:
+        if self.smoothed['trunk_x_ratio'] > sway_limit:
             return False, "KEEP TORSO STRAIGHT!"
 
         # Priority 3: Arm Vectors (Foreshortening & Z-axis Guard)
-        # MOVED UP: Prevents "Error Shadowing". Forward arm causes false shrugs.
-        upper_len = np.linalg.norm(np.array(shoulder) - np.array(elbow))
-        upper_ratio = upper_len / torso_length
-        if upper_ratio < (self.baselines.get('upper_ratio', 0) * self.cfg.stability_ratio):
-            return False, "LIFT TO THE SIDE, NOT FORWARD!"
+        if self.smoothed['upper_ratio'] < (self.baselines.get('upper_ratio', 0) * self.cfg.stability_ratio):
+            return False, "LIFT TO SIDE, NOT FORWARD!"
 
-        if abs(t_elbow.z - t_shoulder.z) > self.cfg.elbow_z_max_diff:
-            return False, "LIFT TO THE SIDE, NOT FORWARD!"
+        if self.smoothed['elbow_z'] > self.cfg.elbow_z_max_diff:
+            return False, "LIFT TO SIDE, NOT FORWARD!"
 
-        # Priority 4: Posture (Shrug - NEW MATH utilizing Nose-to-Shoulder distance)
-        raw_shrug_ratio = abs(shoulder[1] - nose[1]) / torso_length
-        now = time.monotonic()
-        if self.smoothed_shrug_ratio is None or self._last_shrug_time is None:
-            self.smoothed_shrug_ratio = raw_shrug_ratio
-        else:
-            dt = max(now - self._last_shrug_time, 0.0)
-            tau = max(self.cfg.smoothing_time_constant_s, 1e-6)
-            alpha = 1.0 - np.exp(-dt / tau)
-            self.smoothed_shrug_ratio = (alpha * raw_shrug_ratio) + ((1 - alpha) * self.smoothed_shrug_ratio)
-        self._last_shrug_time = now
-
-        # If the shoulder moves UP, the distance to the nose SHRINKS
+        # Priority 4: Posture (Shrug)
         shrug_limit = self.baselines['shrug_ratio'] - self.cfg.shrug_max_ratio
-        if self.smoothed_shrug_ratio < shrug_limit:
-            return False, "RELAX SHOULDER, DO NOT SHRUG!"
+        if self.smoothed['shrug_ratio'] < shrug_limit:
+            return False, "DO NOT SHRUG!"
 
         return True, ""
 
@@ -518,8 +557,6 @@ class ShoulderAbduction(BaseExercise):
 
             self._calib_sums['angle'] += self.smoothed_angle
             self._calib_sums['shrug_ratio'] += abs(current_shoulder[1] - nose[1]) / torso_length
-
-            # FIXED: Anchor baseline sway to the Nose instead of the Shoulder
             self._calib_sums['trunk_x_ratio'] += abs(nose[0] - hip[0]) / torso_length
 
             upper_len = np.linalg.norm(np.array(current_shoulder) - np.array(elbow))
@@ -530,6 +567,13 @@ class ShoulderAbduction(BaseExercise):
             elapsed = now - self._calib_start_time
             if elapsed >= self.cfg.calib_extension_seconds:
                 n = self._calib_sample_count
+
+                if n < 15:
+                    self._calib_start_time = None
+                    self._calib_sums = {k: 0.0 for k in self._calib_sums}
+                    self._calib_sample_count = 0
+                    return "KEEP BODY FULLY VISIBLE!"
+
                 self.target_ext = (self._calib_sums['angle'] / n) + 15
                 self.baselines['shrug_ratio'] = self._calib_sums['shrug_ratio'] / n
                 self.baselines['trunk_x_ratio'] = self._calib_sums['trunk_x_ratio'] / n
@@ -560,7 +604,7 @@ class ShoulderAbduction(BaseExercise):
                 if elapsed_hold >= self.cfg.calib_flex_seconds:
                     avg_flex = self._calib_flex_sums / self._calib_flex_count
                     self.target_flex = avg_flex - self.cfg.flex_buffer_deg
-                    self.stage = "extended"
+                    self.stage = "calibration_returning"
                     return "CALIBRATION COMPLETE!"
 
                 seconds_left = max(0, int(self.cfg.calib_flex_seconds - elapsed_hold) + 1)
@@ -575,6 +619,12 @@ class ShoulderAbduction(BaseExercise):
                     self._calib_transition_start_time = None
                     return "TIMEOUT: PLEASE TRY AGAIN"
                 return "RAISE ARM PAST MINIMUM LIMIT"
+
+        elif self.stage == "calibration_returning":
+            if self.smoothed_angle < self.target_ext:
+                self.stage = "extended"
+                return "START WORKOUT!"
+            return "RETURN TO START..."
 
     def _update_rep_counter(self):
         if self.smoothed_angle < self.target_ext:
@@ -619,6 +669,7 @@ class VideoWorker(threading.Thread):
         cap = None
         pose = None
         csv_file = None
+        csv_writer = None
         try:
             if sys.platform.startswith("win"):
                 cap = cv2.VideoCapture(self.app_cfg.camera_index, cv2.CAP_DSHOW)
@@ -643,20 +694,20 @@ class VideoWorker(threading.Thread):
             csv_writer.writerow(["Timestamp_ISO", "Smoothed_Angle", "Stage", "Good_Form", "Feedback"])
 
             frames_since_flush = 0
-            failed_reads = 0  # NEW: Track consecutive camera read failures
+            failed_reads = 0
 
             while not self._stop_event.is_set():
                 loop_start = time.monotonic()
                 success, img = cap.read()
                 if not success:
                     failed_reads += 1
-                    if failed_reads > 50:  # Roughly 2.5 seconds of dead camera feed
+                    if failed_reads > 50:
                         self._push_error("Camera disconnected or feed lost.")
                         break
                     time.sleep(0.05)
                     continue
 
-                failed_reads = 0  # Reset counter when successful
+                failed_reads = 0
 
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 h, w, _ = img.shape
@@ -674,23 +725,10 @@ class VideoWorker(threading.Thread):
 
                 if results.pose_landmarks:
                     self._mask_face(results.pose_landmarks.landmark, img_rgb, h, w)
-
-                    # --- NEW FIX: Erase face dots before drawing the skeleton ---
-                    # We save the nose visibility first because the "STEP BACK!" check needs it later
-                    original_nose_vis = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value].visibility
-
-                    for i in range(11):  # Landmarks 0 through 10 are the face
-                        results.pose_landmarks.landmark[i].visibility = 0.0
-
                     mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-                    # Restore the nose visibility for the physics engine
-                    results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value].visibility = original_nose_vis
-                    # -----------------------------------------------------------
 
                     angle, joint_pos, is_good, msg = self.exercise.process_frame(results.pose_landmarks.landmark, h, w)
 
-                    # TIGHTENED UI LOGIC: "STEP BACK" now completely overwrites other messages to prevent flicker
                     nose = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
                     if nose.visibility > 0.5 and nose.y < 0.10:
                         is_good = False
@@ -715,7 +753,6 @@ class VideoWorker(threading.Thread):
                         cv2.putText(img_rgb, msg, (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_BAD_RGB, 3, cv2.LINE_AA)
 
                 else:
-                    # NEW: Explicitly handle the case when nobody is detected in the frame
                     is_good = False
                     msg = "NO PERSON DETECTED"
 
@@ -730,12 +767,13 @@ class VideoWorker(threading.Thread):
             logger.exception("Camera/pose worker crashed")
             self._push_error("Camera/pose error - check logs for details.")
         finally:
-            if csv_file is not None:
+            if csv_writer is not None:
                 csv_writer.writerow([])
                 csv_writer.writerow(["--- SESSION SUMMARY ---"])
                 csv_writer.writerow(["Total Reps", self.exercise.counter])
                 for err_type, err_count in self.exercise.error_counts.items():
                     csv_writer.writerow([f"Error: {err_type}", err_count])
+            if csv_file is not None:
                 csv_file.close()
             if cap is not None:
                 cap.release()
@@ -743,29 +781,23 @@ class VideoWorker(threading.Thread):
                 pose.close()
 
     def _mask_face(self, landmarks, img_rgb, h, w):
-        # Landmarks 0 through 10 represent all facial features in MediaPipe
         face_x = []
         face_y = []
 
         for i in range(11):
             lm = landmarks[i]
-            # If the landmark is even slightly visible, grab its coordinates
             if lm.visibility > 0.1:
                 face_x.append(lm.x * w)
                 face_y.append(lm.y * h)
 
-        # If we couldn't find ANY face landmarks, bail out safely
         if not face_x:
             return
 
-        # Calculate the exact center of whatever face parts ARE visible
         cx = int(sum(face_x) / len(face_x))
         cy = int(sum(face_y) / len(face_y))
 
-        # Lock the radius to 12% of the screen height (large enough to cover a side-profile head)
         dynamic_radius = int(h * 0.12)
 
-        # Draw the solid mask
         cv2.circle(img_rgb, (cx, cy), dynamic_radius, (25, 25, 25), -1)
 
     def _push_result(self, img_rgb, counter, stage, msg, is_good):
@@ -802,7 +834,9 @@ class PhysioApp:
         self.root = root
         self.app_cfg = AppConfig()
         self.root.title("Intelligent Physiotherapy Assistant")
-        self.root.geometry("1000x650")
+
+        # INCREASED WIDTH: Give the text panel more room to breathe
+        self.root.geometry("1150x650")
         self.root.configure(bg="#2C3E50")
 
         self.worker = None
@@ -850,11 +884,14 @@ class PhysioApp:
         self.lbl_reps = tk.Label(info_frame, text="Reps: 0", font=info_font, fg="#2ECC71", bg="#2C3E50")
         self.lbl_reps.pack(pady=20)
 
-        self.lbl_stage = tk.Label(info_frame, text="Stage: N/A", font=info_font, fg="#F1C40F", bg="#2C3E50")
+        # ADDED: wraplength and justify to force long stage names to two centered lines
+        self.lbl_stage = tk.Label(info_frame, text="Stage: N/A", font=info_font, fg="#F1C40F", bg="#2C3E50",
+                                  wraplength=300, justify="center")
         self.lbl_stage.pack(pady=20)
 
+        # ADDED: increased wraplength, center justification, and a fixed height of 3 text lines
         self.lbl_feedback = tk.Label(info_frame, text="", font=font.Font(family="Helvetica", size=14, weight="bold"),
-                                     fg="#E74C3C", bg="#2C3E50", wraplength=250)
+                                     fg="#E74C3C", bg="#2C3E50", wraplength=340, height=3, justify="center")
         self.lbl_feedback.pack(pady=40)
 
         btn_stop = tk.Button(info_frame, text="End Session", font=font.Font(family="Helvetica", size=14), bg="#C0392B",
@@ -919,7 +956,6 @@ class PhysioApp:
             worker = self.worker
             self._stopping = True
             worker.stop()
-            # Offload thread joining so UI does not freeze
             self._await_worker_shutdown(worker, callback=on_close_callback)
         else:
             if on_close_callback:
@@ -948,8 +984,7 @@ class PhysioApp:
         self.root.after(200, lambda: self._await_worker_shutdown(worker, attempt + 1, callback))
 
     def on_close(self):
-        self.root.withdraw()  # Instantly hide the window
-        # Request clean shutdown and exit process when finished
+        self.root.withdraw()
         self.stop_tracking(on_close_callback=lambda: sys.exit(0))
 
 

@@ -81,10 +81,22 @@ class ShoulderAbductionConfig(BaseExerciseConfig):
     stability_ratio: float = 0.75
 
 
+@dataclass
+class SquatConfig(BaseExerciseConfig):
+    """Configuration parameters for the scale-invariant Squat protocol."""
+    side_profile_max_shoulder_ratio: float = 0.35
+    trunk_lean_max_ratio: float = 0.80
+    knee_tracking_max_ratio: float = 0.15
+    extension_angle_min_deg: float = 160.0
+    valid_squat_min_rom: float = 30.0
+    flex_buffer_deg: float = 15.0
+
 # ==========================================
 # 2. BASE EXERCISE CLASS (THE ENGINE)
 # ==========================================
 class BaseExercise:
+    button_labels = ("Right Arm", "Left Arm")
+
     def __init__(self, side="right", config: BaseExerciseConfig = None):
         self.cfg = config
         self.side = side.lower()
@@ -635,12 +647,250 @@ class ShoulderAbduction(BaseExercise):
             self.stage = "flexed"
 
 
+class Squat(BaseExercise):
+    display_name = "Squat"
+    slug = "squat"
+
+    # Override the labels specifically for sagittal tracking
+    button_labels = ("Camera on Right Side", "Camera on Left Side")
+
+    def __init__(self, side="right", config: SquatConfig = None):
+        super().__init__(side, config or SquatConfig())
+
+        # ADD 'knee_z' to all three dictionaries
+        self.baselines = {'trunk_x_ratio': 0.0, 'knee_x_ratio': 0.0, 'knee_z': 0.0}
+        self._calib_sums = {'angle': 0.0, 'trunk_x_ratio': 0.0, 'knee_x_ratio': 0.0, 'knee_z': 0.0}
+        self.smoothed = {'shoulder_width_ratio': None, 'trunk_x_ratio': None, 'knee_x_ratio': None, 'knee_z': None}
+        self._last_smooth_time = None
+
+    def _get_primary_kinematics(self, landmarks, h, w):
+        req_vis = self.cfg.min_visibility_calibration if self.stage.startswith(
+            "calib") else self.cfg.min_visibility_tracking
+        idx = mp_pose.PoseLandmark
+
+        h_idx, k_idx, a_idx = (idx.RIGHT_HIP, idx.RIGHT_KNEE, idx.RIGHT_ANKLE) if self.side == "right" else \
+            (idx.LEFT_HIP, idx.LEFT_KNEE, idx.LEFT_ANKLE)
+
+        # Visibility filter to prevent tracking hallucinations
+        if min(landmarks[h_idx.value].visibility, landmarks[k_idx.value].visibility,
+               landmarks[a_idx.value].visibility) < req_vis:
+            return None, None
+
+        hip = [landmarks[h_idx.value].x * w, landmarks[h_idx.value].y * h]
+        knee = [landmarks[k_idx.value].x * w, landmarks[k_idx.value].y * h]
+        ankle = [landmarks[a_idx.value].x * w, landmarks[a_idx.value].y * h]
+
+        return self.calculate_angle(hip, knee, ankle), knee
+
+    def _evaluate_form(self, landmarks, h, w):
+        idx = mp_pose.PoseLandmark
+        s_idx, h_idx, k_idx = (idx.RIGHT_SHOULDER, idx.RIGHT_HIP, idx.RIGHT_KNEE) if self.side == "right" else \
+            (idx.LEFT_SHOULDER, idx.LEFT_HIP, idx.LEFT_KNEE)
+
+        t_idx = idx.RIGHT_FOOT_INDEX if self.side == "right" else idx.LEFT_FOOT_INDEX
+        opp_s_idx = idx.LEFT_SHOULDER if self.side == "right" else idx.RIGHT_SHOULDER
+
+        t_shoulder = landmarks[s_idx.value]
+        t_hip = landmarks[h_idx.value]
+        t_knee = landmarks[k_idx.value]
+        t_toe = landmarks[t_idx.value]
+        t_opp_shoulder = landmarks[opp_s_idx.value]
+
+        # NEW: The Hidden Toe / Visibility Guard
+        req_vis = self.cfg.min_visibility_calibration if self.stage.startswith(
+            "calib") else self.cfg.min_visibility_tracking
+        if min(t_shoulder.visibility, t_toe.visibility, t_opp_shoulder.visibility) < req_vis:
+            return False, "FOOT OR SHOULDER HIDDEN!"
+
+        shoulder = [t_shoulder.x * w, t_shoulder.y * h]
+        hip = [t_hip.x * w, t_hip.y * h]
+        knee = [t_knee.x * w, t_knee.y * h]
+        toe = [t_toe.x * w, t_toe.y * h]
+        opp_shoulder = [t_opp_shoulder.x * w, t_opp_shoulder.y * h]
+
+        torso_length = max(np.linalg.norm(np.array(shoulder) - np.array(hip)), 1e-6)
+        facing_dir = 1 if toe[0] > hip[0] else -1
+        knee_past_toe_dist = (knee[0] - toe[0]) * facing_dir
+
+        now = time.monotonic()
+        raw_signals = {
+            'shoulder_width_ratio': abs(shoulder[0] - opp_shoulder[0]) / torso_length,
+            'trunk_x_ratio': abs(shoulder[0] - hip[0]) / torso_length,
+            'knee_x_ratio': max(0, knee_past_toe_dist) / torso_length,
+            'knee_z': abs(t_knee.z - t_hip.z)  # NEW: Extract raw Z-axis depth for the knee
+        }
+
+        # Apply time-constant EMA smoothing to eliminate GUI flickering
+        if self._last_smooth_time is None or any(v is None for v in self.smoothed.values()):
+            self.smoothed.update(raw_signals)
+        else:
+            dt = max(now - self._last_smooth_time, 0.0)
+            tau = max(self.cfg.smoothing_time_constant_s, 1e-6)
+            alpha = 1.0 - np.exp(-dt / tau)
+            for k in raw_signals:
+                self.smoothed[k] = (alpha * raw_signals[k]) + ((1 - alpha) * self.smoothed[k])
+        self._last_smooth_time = now
+
+        # Priority 1: Sagittal View Guard
+        if self.smoothed['shoulder_width_ratio'] > self.cfg.side_profile_max_shoulder_ratio:
+            return False, "TURN TO SIDE PROFILE!"
+
+        if self.stage.startswith("calib"): return True, ""
+
+        # REORDERED TO PREVENT ERROR SHADOWING:
+
+        # Priority 2: Knee Tracking (Horizontal Past Toes)
+        if self.smoothed['knee_x_ratio'] > self.cfg.knee_tracking_max_ratio:
+            return False, "KNEES PAST TOES!"
+
+        # Priority 3: Postural Compensation (Moved to last)
+        if self.smoothed['trunk_x_ratio'] > self.cfg.trunk_lean_max_ratio:
+            return False, "TRUNK LEAN TOO FAR FORWARD!"
+
+        return True, ""
+
+    def _route_calibration(self, is_good, err_msg, landmarks, h, w):
+        now = time.monotonic()
+
+        idx = mp_pose.PoseLandmark
+        s_idx = idx.RIGHT_SHOULDER if self.side == "right" else idx.LEFT_SHOULDER
+        current_shoulder = [landmarks[s_idx.value].x * w, landmarks[s_idx.value].y * h]
+
+        if not hasattr(self, '_prev_shoulder'):
+            self._prev_shoulder = current_shoulder
+
+        motion = np.linalg.norm(np.array(current_shoulder) - np.array(self._prev_shoulder))
+        self._prev_shoulder = current_shoulder
+
+        if not is_good:
+            self._calib_start_time = None
+            self._calib_sums = {k: 0.0 for k in self._calib_sums}
+            self._calib_sample_count = 0
+            return err_msg
+
+        # STAGE 1: STANDING CALIBRATION
+        if self.stage == "calibration_start":
+            if self.smoothed_angle < self.cfg.extension_angle_min_deg:
+                self._calib_start_time = None
+                self._calib_sums = {k: 0.0 for k in self._calib_sums}
+                self._calib_sample_count = 0
+                return "STAND STRAIGHT TO START"
+
+            h_idx = idx.RIGHT_HIP if self.side == "right" else idx.LEFT_HIP
+            hip = [landmarks[h_idx.value].x * w, landmarks[h_idx.value].y * h]
+            torso_length = max(np.linalg.norm(np.array(current_shoulder) - np.array(hip)), 1e-6)
+
+            # Velocity guard against calibration while walking into frame
+            if motion > (0.025 * torso_length):
+                self._calib_start_time = now
+                self._calib_sums = {k: 0.0 for k in self._calib_sums}
+                self._calib_sample_count = 0
+                return "STAND COMPLETELY STILL!"
+
+            if self._calib_start_time is None: self._calib_start_time = now
+
+            self._calib_sums['angle'] += self.smoothed_angle
+            self._calib_sums['trunk_x_ratio'] += self.smoothed['trunk_x_ratio']
+            self._calib_sums['knee_x_ratio'] += self.smoothed['knee_x_ratio']
+            self._calib_sums['knee_z'] += self.smoothed['knee_z']
+            self._calib_sample_count += 1
+
+            elapsed = now - self._calib_start_time
+            if elapsed >= self.cfg.calib_extension_seconds:
+                n = self._calib_sample_count
+                if n < 15:
+                    self._calib_start_time = None
+                    self._calib_sums = {k: 0.0 for k in self._calib_sums}
+                    self._calib_sample_count = 0
+                    return "KEEP BODY FULLY VISIBLE!"
+
+                # Secure statistical baselines
+                self.target_ext = (self._calib_sums['angle'] / n) - self.cfg.flex_buffer_deg
+                self.baselines['trunk_x_ratio'] = self._calib_sums['trunk_x_ratio'] / n
+                self.baselines['knee_x_ratio'] = self._calib_sums['knee_x_ratio'] / n
+                self.baselines['knee_z'] = self._calib_sums['knee_z'] / n
+                self.stage = "calibration_transition"
+
+            return f"STAND STILL: {max(0, int(self.cfg.calib_extension_seconds - elapsed) + 1)}s"
+
+        # STAGE 2: TRANSITION TO DEEP SQUAT
+        elif self.stage == "calibration_transition":
+            if self._calib_transition_start_time is None: self._calib_transition_start_time = now
+            if (now - self._calib_transition_start_time) > self.cfg.calib_transition_seconds:
+                self.stage = "calibration_flex"
+            return "SUCCESS! NOW SQUAT DOWN..."
+
+        # STAGE 3: ADAPTIVE SQUAT CALIBRATION
+        elif self.stage == "calibration_flex":
+            if self._calib_flex_start_time is None: self._calib_flex_start_time = now
+            elapsed_total = now - self._calib_flex_start_time
+
+            # Guardrail: Ensure they have dropped at least the minimum ROM from standing
+            if self.smoothed_angle < (self.target_ext - self.cfg.valid_squat_min_rom):
+
+                # Re-calculate torso length for the velocity guard
+                h_idx = idx.RIGHT_HIP if self.side == "right" else idx.LEFT_HIP
+                hip = [landmarks[h_idx.value].x * w, landmarks[h_idx.value].y * h]
+                torso_length = max(np.linalg.norm(np.array(current_shoulder) - np.array(hip)), 1e-6)
+
+                # Velocity guard: Ensure they have reached the bottom and are holding still
+                if motion < (0.025 * torso_length):
+                    if self._calib_flex_hold_start_time is None:
+                        self._calib_flex_hold_start_time = now
+                        self._calib_flex_sums = 0.0
+                        self._calib_flex_count = 0
+
+                    self._calib_flex_sums += self.smoothed_angle
+                    self._calib_flex_count += 1
+                    elapsed_hold = now - self._calib_flex_hold_start_time
+
+                    if elapsed_hold >= self.cfg.calib_flex_seconds:
+                        avg_flex = self._calib_flex_sums / max(1, self._calib_flex_count)
+                        self.target_flex = avg_flex + self.cfg.flex_buffer_deg
+                        self.stage = "calibration_returning"
+                        return "MAX DEPTH SAVED!"
+
+                    seconds_left = max(0, int(self.cfg.calib_flex_seconds - elapsed_hold) + 1)
+                    return f"HOLD SQUAT DEPTH: {seconds_left}s"
+                else:
+                    # Patient is still descending or wobbling
+                    self._calib_flex_hold_start_time = None
+                    self._calib_flex_sums = 0.0
+                    self._calib_flex_count = 0
+                    return "REACH MAX DEPTH AND HOLD STILL"
+            else:
+                self._calib_flex_hold_start_time = None
+                self._calib_flex_sums = 0.0
+                self._calib_flex_count = 0
+
+                if elapsed_total >= self.cfg.calib_flex_timeout_seconds:
+                    self.stage = "calibration_transition"
+                    self._calib_transition_start_time = None
+                    return "TIMEOUT: PLEASE TRY AGAIN"
+                return "SQUAT DEEPER TO CALIBRATE"
+
+        # STAGE 4: RETURN TO BASELINE
+        elif self.stage == "calibration_returning":
+            if self.smoothed_angle > self.target_ext:
+                self.stage = "extended"
+                return "START WORKOUT!"
+            return "RETURN TO STANDING..."
+
+    def _update_rep_counter(self):
+        # Angle increases when standing (extended), decreases when squatting (flexed)
+        if self.smoothed_angle > self.target_ext:
+            if self.stage == 'flexed':
+                self.counter += 1
+            self.stage = "extended"
+        elif self.smoothed_angle < self.target_flex and self.stage == 'extended':
+            self.stage = "flexed"
 # ==========================================
 # 5. REGISTRY
 # ==========================================
 EXERCISE_REGISTRY = {
     ElbowFlexion.slug: ElbowFlexion,
-    ShoulderAbduction.slug: ShoulderAbduction
+    ShoulderAbduction.slug: ShoulderAbduction,
+    Squat.slug: Squat
 }
 
 
@@ -866,13 +1116,18 @@ class PhysioApp:
                                      fg="#E74C3C", bg="#2C3E50")
         self.status_label.pack(pady=(0, 10))
 
+        # --- UPDATED LOOP START ---
         for slug, exercise_class in EXERCISE_REGISTRY.items():
             ex_name = exercise_class.display_name
-            tk.Button(self.main_menu_frame, text=f"{ex_name} (Right Arm)", font=btn_font, bg="#2980B9", fg="white",
-                      width=30, height=2, command=lambda s=slug: self.start_tracking(s, "right")).pack(pady=5)
-            tk.Button(self.main_menu_frame, text=f"{ex_name} (Left Arm)", font=btn_font, bg="#2980B9", fg="white",
-                      width=30, height=2, command=lambda s=slug: self.start_tracking(s, "left")).pack(pady=(5, 15))
 
+            # Fetch the custom labels, falling back to Arm if missing
+            lbl_right, lbl_left = getattr(exercise_class, 'button_labels', ("Right Arm", "Left Arm"))
+
+            tk.Button(self.main_menu_frame, text=f"{ex_name} ({lbl_right})", font=btn_font, bg="#2980B9", fg="white",
+                      width=30, height=2, command=lambda s=slug: self.start_tracking(s, "right")).pack(pady=5)
+            tk.Button(self.main_menu_frame, text=f"{ex_name} ({lbl_left})", font=btn_font, bg="#2980B9", fg="white",
+                      width=30, height=2, command=lambda s=slug: self.start_tracking(s, "left")).pack(pady=(5, 15))
+        # --- UPDATED LOOP END ---
     def build_tracking_dashboard(self):
         self.video_label = tk.Label(self.tracking_frame, bg="black")
         self.video_label.pack(side="left", padx=20, pady=20)

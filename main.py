@@ -664,7 +664,6 @@ class Squat(BaseExercise):
     def __init__(self, side="right", config: SquatConfig = None):
         super().__init__(side, config or SquatConfig())
 
-        self.baselines = {}
         self._calib_sums = {'angle': 0.0}
         self.smoothed = {'shoulder_width_ratio': None, 'trunk_x_ratio': None, 'knee_x_ratio': None}
         self._last_smooth_time = None

@@ -66,6 +66,8 @@ class ElbowFlexionConfig(BaseExerciseConfig):
     min_rom_deg: float = 40.0
     z_stability_ratio: float = 0.75
     stability_ratio: float = 0.75
+    ext_buffer_deg: float = 15.0
+    flex_buffer_deg: float = 15.0
 
 
 @dataclass
@@ -79,6 +81,7 @@ class ShoulderAbductionConfig(BaseExerciseConfig):
     min_rom_deg: float = 20.0
     flex_buffer_deg: float = 10.0
     stability_ratio: float = 0.75
+    ext_buffer_deg: float = 15.0
 
 
 @dataclass
@@ -347,8 +350,12 @@ class ElbowFlexion(BaseExercise):
                                                                                             idx.LEFT_WRIST)
             t_s, t_e, t_w = landmarks[s_idx.value], landmarks[e_idx.value], landmarks[w_idx.value]
 
-            upper_len = np.linalg.norm(np.array([t_s.x, t_s.y]) - np.array([t_e.x, t_e.y])) * h
-            forearm_len = np.linalg.norm(np.array([t_e.x, t_e.y]) - np.array([t_w.x, t_w.y])) * h
+            s_px = [t_s.x * w, t_s.y * h]
+            e_px = [t_e.x * w, t_e.y * h]
+            w_px = [t_w.x * w, t_w.y * h]
+
+            upper_len = np.linalg.norm(np.array(s_px) - np.array(e_px))
+            forearm_len = np.linalg.norm(np.array(e_px) - np.array(w_px))
 
             self._calib_sums['upper_ratio'] += upper_len / torso_len
             self._calib_sums['forearm_ratio'] += forearm_len / torso_len
@@ -371,7 +378,7 @@ class ElbowFlexion(BaseExercise):
                 self.baselines['elbow_z'] = self._calib_sums['elbow_z'] / n
                 self.baselines['upper_ratio'] = self._calib_sums['upper_ratio'] / n
                 self.baselines['forearm_ratio'] = self._calib_sums['forearm_ratio'] / n
-                self.target_ext = (self._calib_sums['angle'] / n) - 15
+                self.target_ext = (self._calib_sums['angle'] / n) - self.cfg.ext_buffer_deg
                 self.stage = "calibration_transition"
             return f"STAND STILL: {max(0, int(self.cfg.calib_extension_seconds - elapsed) + 1)}s"
 
@@ -397,7 +404,7 @@ class ElbowFlexion(BaseExercise):
 
                 if elapsed_hold >= self.cfg.calib_flex_seconds:
                     avg_flex = self._calib_flex_sums / self._calib_flex_count
-                    self.target_flex = avg_flex + 15
+                    self.target_flex = avg_flex + self.cfg.flex_buffer_deg
                     self.stage = "calibration_returning"
                     return "CALIBRATION COMPLETE!"
 
@@ -586,7 +593,7 @@ class ShoulderAbduction(BaseExercise):
                     self._calib_sample_count = 0
                     return "KEEP BODY FULLY VISIBLE!"
 
-                self.target_ext = (self._calib_sums['angle'] / n) + 15
+                self.target_ext = (self._calib_sums['angle'] / n) + self.cfg.ext_buffer_deg
                 self.baselines['shrug_ratio'] = self._calib_sums['shrug_ratio'] / n
                 self.baselines['trunk_x_ratio'] = self._calib_sums['trunk_x_ratio'] / n
                 self.baselines['upper_ratio'] = self._calib_sums['upper_ratio'] / n
@@ -657,10 +664,9 @@ class Squat(BaseExercise):
     def __init__(self, side="right", config: SquatConfig = None):
         super().__init__(side, config or SquatConfig())
 
-        # ADD 'knee_z' to all three dictionaries
-        self.baselines = {'trunk_x_ratio': 0.0, 'knee_x_ratio': 0.0, 'knee_z': 0.0}
-        self._calib_sums = {'angle': 0.0, 'trunk_x_ratio': 0.0, 'knee_x_ratio': 0.0, 'knee_z': 0.0}
-        self.smoothed = {'shoulder_width_ratio': None, 'trunk_x_ratio': None, 'knee_x_ratio': None, 'knee_z': None}
+        self.baselines = {}
+        self._calib_sums = {'angle': 0.0}
+        self.smoothed = {'shoulder_width_ratio': None, 'trunk_x_ratio': None, 'knee_x_ratio': None}
         self._last_smooth_time = None
 
     def _get_primary_kinematics(self, landmarks, h, w):
@@ -716,8 +722,7 @@ class Squat(BaseExercise):
         raw_signals = {
             'shoulder_width_ratio': abs(shoulder[0] - opp_shoulder[0]) / torso_length,
             'trunk_x_ratio': abs(shoulder[0] - hip[0]) / torso_length,
-            'knee_x_ratio': max(0, knee_past_toe_dist) / torso_length,
-            'knee_z': abs(t_knee.z - t_hip.z)  # NEW: Extract raw Z-axis depth for the knee
+            'knee_x_ratio': max(0, knee_past_toe_dist) / torso_length
         }
 
         # Apply time-constant EMA smoothing to eliminate GUI flickering
@@ -790,9 +795,6 @@ class Squat(BaseExercise):
             if self._calib_start_time is None: self._calib_start_time = now
 
             self._calib_sums['angle'] += self.smoothed_angle
-            self._calib_sums['trunk_x_ratio'] += self.smoothed['trunk_x_ratio']
-            self._calib_sums['knee_x_ratio'] += self.smoothed['knee_x_ratio']
-            self._calib_sums['knee_z'] += self.smoothed['knee_z']
             self._calib_sample_count += 1
 
             elapsed = now - self._calib_start_time
@@ -806,9 +808,6 @@ class Squat(BaseExercise):
 
                 # Secure statistical baselines
                 self.target_ext = (self._calib_sums['angle'] / n) - self.cfg.flex_buffer_deg
-                self.baselines['trunk_x_ratio'] = self._calib_sums['trunk_x_ratio'] / n
-                self.baselines['knee_x_ratio'] = self._calib_sums['knee_x_ratio'] / n
-                self.baselines['knee_z'] = self._calib_sums['knee_z'] / n
                 self.stage = "calibration_transition"
 
             return f"STAND STILL: {max(0, int(self.cfg.calib_extension_seconds - elapsed) + 1)}s"
@@ -977,12 +976,15 @@ class VideoWorker(threading.Thread):
                     self._mask_face(results.pose_landmarks.landmark, img_rgb, h, w)
                     mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-                    angle, joint_pos, is_good, msg = self.exercise.process_frame(results.pose_landmarks.landmark, h, w)
-
                     nose = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
+
+                    # --- NEW: GUARD EXECUTED BEFORE THE PHYSICS ENGINE ---
                     if nose.visibility > 0.5 and nose.y < 0.10:
                         is_good = False
                         msg = "STEP BACK!"
+                        angle, joint_pos = None, (0, 0)
+                    else:
+                        angle, joint_pos, is_good, msg = self.exercise.process_frame(results.pose_landmarks.landmark, h, w)
 
                     stage = self.exercise.stage
                     counter = self.exercise.counter

@@ -41,6 +41,32 @@ The system utilizes MediaPipe's 33-point topological skeletal map to construct t
 
 ![MediaPipe Pose Landmark Topology](images/mediapipe-topology.jpg)
 
+### Project Structure
+
+The four architectural layers above map directly onto the module layout:
+
+```
+physio_assistant/
+├── constants.py   # logging setup, colors, SESSIONS_DIR, CSV flush interval
+├── config.py      # AppConfig + BaseExerciseConfig and its 3 subclasses
+├── engine.py      # BaseExercise, ElbowFlexion, ShoulderAbduction, Squat, EXERCISE_REGISTRY
+├── worker.py      # VideoWorker (background thread: capture + inference loop)
+├── app.py         # PhysioApp (Tkinter GUI, worker lifecycle, polling loop)
+└── main.py        # thin entry point — python main.py
+```
+
+Dependencies only point one way, so the import graph is acyclic:
+
+```
+config.py, constants.py   (no internal deps)
+engine.py     -> config.py
+worker.py     -> constants.py, engine.py, config.py
+app.py        -> constants.py, config.py, engine.py, worker.py
+main.py       -> app.py
+```
+
+`EXERCISE_REGISTRY` is defined once in `engine.py`; `worker.py` (default `exercise_cls`) and `app.py` (exercise menu) both import it from there rather than maintaining separate copies.
+
 ---
 
 ## Technical Decisions & Biomechanical Logic
@@ -82,11 +108,13 @@ pip install mediapipe==0.10.21 opencv-python==4.11.0 numpy==1.26.4 pillow
 
 ### 3. Execution
 
-Run the main script to launch the application:
+Run the entry point to launch the application:
 
 ```bash
 python main.py
 ```
+
+`main.py` only boots the Tkinter root and `PhysioApp` — see [Project Structure](#project-structure) above for where the actual logic lives.
 
 You'll see a menu to select an exercise protocol and which side (or camera position, for Squat) to track. Camera framing requirements differ by exercise — see the table above:
 

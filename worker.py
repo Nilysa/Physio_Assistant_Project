@@ -31,9 +31,14 @@ from constants import (
     logger,
 )
 from engine import ElbowFlexion, mp_draw, mp_pose
+import mediapipe as mp
 
-
+mp_face = mp.solutions.face_detection
 class VideoWorker(threading.Thread):
+    FACE_MASK_HOLD_SECONDS = 0.6
+    FACE_MASK_SMOOTHING_TIME_CONSTANT_S = 0.12
+    FACE_MASK_RADIUS_SMOOTHING_TIME_CONSTANT_S = 0.6   # much slower than position
+
     def __init__(self, side, csv_path, result_queue, app_cfg: AppConfig, config=None, exercise_cls=ElbowFlexion,
                  model_complexity=1):
         super().__init__(daemon=True)
@@ -43,6 +48,10 @@ class VideoWorker(threading.Thread):
         self.csv_path = csv_path
         self.model_complexity = model_complexity
         self._stop_event = threading.Event()
+        self._mask_center = None
+        self._mask_radius = None
+        self._mask_last_seen = None
+        self._mask_last_smooth_time = None
 
     def stop(self):
         self._stop_event.set()
@@ -54,6 +63,7 @@ class VideoWorker(threading.Thread):
     def run(self):
         cap = None
         pose = None
+        face_detector = None
         csv_file = None
         csv_writer = None
         try:
@@ -73,6 +83,8 @@ class VideoWorker(threading.Thread):
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+
+            face_detector = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5)
 
             os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
             csv_file = open(self.csv_path, mode='w', newline='')
@@ -105,12 +117,13 @@ class VideoWorker(threading.Thread):
                     img_for_inference = img_rgb
 
                 results = pose.process(img_for_inference)
+                self._mask_any_face(img_rgb, face_detector, h, w,
+                                    results.pose_landmarks.landmark if results.pose_landmarks else None)
                 angle, is_good, msg = None, False, ""
                 stage = self.exercise.stage
                 counter = self.exercise.counter
 
                 if results.pose_landmarks:
-                    self._mask_face(results.pose_landmarks.landmark, img_rgb, h, w)
                     mp_draw.draw_landmarks(img_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
                     nose = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
@@ -168,26 +181,86 @@ class VideoWorker(threading.Thread):
                 cap.release()
             if pose is not None:
                 pose.close()
+            if face_detector is not None:
+                face_detector.close()
 
-    def _mask_face(self, landmarks, img_rgb, h, w):
-        face_x = []
-        face_y = []
+    def _get_face_candidate(self, img_rgb, face_detector, h, w, pose_landmarks):
+        if pose_landmarks is not None:
+            idx = mp_pose.PoseLandmark
+            face_x, face_y = [], []
+            for i in range(11):
+                lm = pose_landmarks[i]
+                if lm.visibility > 0.1:
+                    face_x.append(lm.x * w)
+                    face_y.append(lm.y * h)
 
-        for i in range(11):
-            lm = landmarks[i]
-            if lm.visibility > 0.1:
-                face_x.append(lm.x * w)
-                face_y.append(lm.y * h)
+            # Torso length (shoulder-to-hip) stays valid at any body rotation,
+            # unlike shoulder width, which is *designed* to collapse toward
+            # zero in side profile (see side_profile_max_shoulder_ratio).
+            candidates = [
+                (idx.RIGHT_SHOULDER, idx.RIGHT_HIP),
+                (idx.LEFT_SHOULDER, idx.LEFT_HIP),
+            ]
+            best = None
+            for sh_lm, hip_lm in candidates:
+                sh, hip = pose_landmarks[sh_lm.value], pose_landmarks[hip_lm.value]
+                vis = min(sh.visibility, hip.visibility)
+                if best is None or vis > best[0]:
+                    best = (vis, sh, hip)
+            vis, sh, hip = best
 
-        if not face_x:
+            if face_x and vis > 0.3:
+                torso_len = np.hypot((sh.x - hip.x) * w, (sh.y - hip.y) * h)
+                if torso_len > 1e-3:
+                    cx = sum(face_x) / len(face_x)
+                    cy = sum(face_y) / len(face_y)
+                    return cx, cy, torso_len * 0.28  # tune this if too big/small
+
+        result = face_detector.process(img_rgb)
+        if result.detections:
+            box = result.detections[0].location_data.relative_bounding_box
+            cx = (box.xmin + box.width / 2) * w
+            cy = (box.ymin + box.height / 2) * h
+            r = max(box.width * w, box.height * h) * 0.75
+            return cx, cy, r
+
+        return None
+
+    def _mask_any_face(self, img_rgb, face_detector, h, w, pose_landmarks=None):
+        now = time.monotonic()
+        candidate = self._get_face_candidate(img_rgb, face_detector, h, w, pose_landmarks)
+
+        if candidate is not None:
+            cx, cy, r = candidate
+            if self._mask_center is None or self._mask_last_smooth_time is None:
+                self._mask_center, self._mask_radius = (cx, cy), r
+            else:
+                dt = max(now - self._mask_last_smooth_time, 0.0)
+                alpha_pos = 1.0 - np.exp(-dt / max(self.FACE_MASK_SMOOTHING_TIME_CONSTANT_S, 1e-6))
+                alpha_rad = 1.0 - np.exp(-dt / max(self.FACE_MASK_RADIUS_SMOOTHING_TIME_CONSTANT_S, 1e-6))
+                px, py = self._mask_center
+                self._mask_center = (px + alpha_pos * (cx - px), py + alpha_pos * (cy - py))
+                self._mask_radius += alpha_rad * (r - self._mask_radius)
+            self._mask_last_smooth_time = now
+            self._mask_last_seen = now
+        elif self._mask_last_seen is not None and (now - self._mask_last_seen) > self.FACE_MASK_HOLD_SECONDS:
+            # No face signal at all for a while -- they've likely stepped fully
+            # out of frame, so stop drawing a stale mask.
+            self._mask_center, self._mask_radius, self._mask_last_smooth_time = None, None, None
+
+        if self._mask_center is None:
             return
 
-        cx = int(sum(face_x) / len(face_x))
-        cy = int(sum(face_y) / len(face_y))
+        cx, cy, r = int(self._mask_center[0]), int(self._mask_center[1]), int(self._mask_radius)
+        x1, y1 = max(cx - r, 0), max(cy - r, 0)
+        x2, y2 = min(cx + r, w), min(cy + r, h)
+        if x2 <= x1 or y2 <= y1:
+            return
 
-        dynamic_radius = int(h * 0.12)
-
-        cv2.circle(img_rgb, (cx, cy), dynamic_radius, (25, 25, 25), -1)
+        roi = img_rgb[y1:y2, x1:x2]
+        k = max(15, (min(roi.shape[0], roi.shape[1]) // 2) | 1)
+        img_rgb[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (k, k), 0)
+        cv2.circle(img_rgb, (cx, cy), r, (25, 25, 25), -1)
 
     def _push_result(self, img_rgb, counter, stage, msg, is_good):
         try:

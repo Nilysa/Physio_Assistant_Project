@@ -13,6 +13,8 @@ depending on the other -- this is what keeps the import graph acyclic:
     main.py    -> app.py
 """
 import logging
+import sys
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,5 +24,12 @@ logger = logging.getLogger("physio_assistant")
 
 COLOR_GOOD_RGB = (46, 204, 113)  # green
 COLOR_BAD_RGB = (231, 76, 60)  # red
-SESSIONS_DIR = "sessions"
+if getattr(sys, "frozen", False):
+    # Running as a bundled .exe -- anchor to the executable's own folder
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # Running as a normal .py script
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 CSV_FLUSH_EVERY_N_FRAMES = 15
